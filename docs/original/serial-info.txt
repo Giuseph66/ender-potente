@@ -1,0 +1,5 @@
+Device: /dev/ttyUSB0
+USB identity: 1a86:7523 QinHeng Electronics CH340 serial converter
+Baudrate: 115200
+Commands queried: M115, M503
+Commands that modify printer state: none

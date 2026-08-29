@@ -1,0 +1,52 @@
+echo:  G21    ; Units in mm (mm)
+echo:  M149 C ; Units in Celsius
+
+echo:; Filament settings: Disabled
+echo:  M200 S0 D1.75
+echo:; Steps per unit:
+echo: M92 X80.00 Y80.00 Z400.00 E93.00
+echo:; Maximum feedrates (units/s):
+echo:  M203 X500.00 Y500.00 Z10.00 E50.00
+echo:; Maximum Acceleration (units/s2):
+echo:  M201 X500.00 Y500.00 Z100.00 E5000.00
+echo:; Acceleration (units/s2): P<print_accel> R<retract_accel> T<travel_accel>
+echo:  M204 P500.00 R1000.00 T500.00
+echo:; Advanced: B<min_segment_time_us> S<min_feedrate> T<min_travel_feedrate> X<max_x_jerk> Y<max_y_jerk> Z<max_z_jerk> E<max_e_jerk>
+echo:  M205 B20000.00 S0.00 T0.00 X8.00 Y8.00 Z0.40 E5.00
+echo:; Home offset:
+echo:  M206 X0.00 Y0.00 Z0.00
+echo:; Auto Bed Leveling:
+echo:  M420 S1
+echo:  G29 W I0 J0 Z0.34400
+echo:  G29 W I1 J0 Z0.01100
+echo:  G29 W I2 J0 Z-0.31300
+echo:  G29 W I3 J0 Z-0.63650
+echo:  G29 W I0 J1 Z0.42600
+echo:  G29 W I1 J1 Z0.14750
+echo:  G29 W I2 J1 Z-0.14400
+echo:  G29 W I3 J1 Z-0.44600
+echo:  G29 W I0 J2 Z0.52950
+echo:  G29 W I1 J2 Z0.30250
+echo:  G29 W I2 J2 Z0.03850
+echo:  G29 W I3 J2 Z-0.24650
+echo:  G29 W I0 J3 Z0.55350
+echo:  G29 W I1 J3 Z0.35150
+echo:  G29 W I2 J3 Z-0.74900
+echo:  G29 W I3 J3 Z-0.10600
+echo:; Material heatup parameters:
+echo:  M145 S0 H200.00 B60.00 F255
+echo:  M145 S1 H240.00 B80.00 F255
+echo:; PID settings:
+echo:  M301 P25.80 I2.50 D66.64
+echo:  M304 P198.96 I38.80 D680.25
+echo:; Power-Loss Recovery:
+echo:  M413 S1
+echo:; Z-Probe Offset (mm):
+echo:  M851 X-39.00 Y-10.00 Z-2.00
+echo:; Filament load/unload lengths:
+echo:  M603 L0.00 U100.00
+echo:; Filament runout sensor:
+echo:  M412 S0
+echo:; UI Language:
+echo:  M414 S5
+ok
