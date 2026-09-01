@@ -568,6 +568,70 @@ abstract final class PlotImporter {
     }
   }
 
+  static const _skeletonSpurPruneLength = 6;
+
+  /// Remove pontas curtas penduradas em bifurcações: ruído típico do
+  /// afinamento (cantos e pontas arredondadas geram um "graveto" curto que,
+  /// sem isso, viraria um traço minúsculo e desconexo na rota final.
+  static void _pruneSkeletonSpurs(
+    List<int> points,
+    Map<int, List<int>> neighborsOf,
+  ) {
+    for (var pass = 0; pass < 4; pass++) {
+      final endpoints = [
+        for (final key in points)
+          if (neighborsOf[key]?.length == 1) key,
+      ];
+      var prunedAny = false;
+      for (final start in endpoints) {
+        final startNeighbors = neighborsOf[start];
+        if (startNeighbors == null || startNeighbors.length != 1) {
+          continue;
+        }
+        final chain = <int>[start];
+        var previous = start;
+        var current = startNeighbors.first;
+        while (true) {
+          final currentNeighbors = neighborsOf[current];
+          if (currentNeighbors == null || currentNeighbors.length != 2) {
+            break;
+          }
+          chain.add(current);
+          if (chain.length > _skeletonSpurPruneLength) {
+            break;
+          }
+          final forward = currentNeighbors.where((c) => c != previous);
+          if (forward.isEmpty) {
+            break;
+          }
+          previous = current;
+          current = forward.first;
+        }
+        final endNeighbors = neighborsOf[current];
+        final isSpur = chain.length <= _skeletonSpurPruneLength &&
+            endNeighbors != null &&
+            endNeighbors.length >= 3;
+        if (!isSpur) {
+          continue;
+        }
+        for (final pixel in chain) {
+          final pixelNeighbors = neighborsOf.remove(pixel);
+          if (pixelNeighbors == null) {
+            continue;
+          }
+          for (final neighbor in pixelNeighbors) {
+            neighborsOf[neighbor]?.remove(pixel);
+          }
+          points.remove(pixel);
+        }
+        prunedAny = true;
+      }
+      if (!prunedAny) {
+        break;
+      }
+    }
+  }
+
   /// Percorre um esqueleto de 1 pixel e monta polilinhas entre pontas e
   /// bifurcações (e laços fechados isolados que sobrarem).
   static List<List<ui.Offset>> _vectorizeSkeleton(
@@ -575,10 +639,11 @@ abstract final class PlotImporter {
     int width,
     int height,
   ) {
-    const dirs = [
-      [-1, -1], [0, -1], [1, -1],
-      [-1, 0], [1, 0],
-      [-1, 1], [0, 1], [1, 1],
+    const orthogonal = [
+      [0, -1], [1, 0], [0, 1], [-1, 0],
+    ];
+    const diagonal = [
+      [1, -1], [1, 1], [-1, 1], [-1, -1],
     ];
     bool at(int x, int y) =>
         x >= 0 && x < width && y >= 0 && y < height && mask[y][x];
@@ -596,10 +661,23 @@ abstract final class PlotImporter {
         final key = keyOf(x, y);
         points.add(key);
         final neighbors = <int>[];
-        for (final d in dirs) {
+        for (final d in orthogonal) {
           if (at(x + d[0], y + d[1])) {
             neighbors.add(keyOf(x + d[0], y + d[1]));
           }
+        }
+        // Uma diagonal só conta se nenhum dos dois vizinhos ortogonais que a
+        // "cruzam" já estiver presente: senão ela é uma ponte redundante que
+        // fecha um triângulo e cria uma bifurcação falsa (artefato de
+        // serrilhado da rasterização), fragmentando a linha em pedaços.
+        for (final d in diagonal) {
+          if (!at(x + d[0], y + d[1])) {
+            continue;
+          }
+          if (at(x + d[0], y) || at(x, y + d[1])) {
+            continue;
+          }
+          neighbors.add(keyOf(x + d[0], y + d[1]));
         }
         neighborsOf[key] = neighbors;
       }
@@ -607,6 +685,7 @@ abstract final class PlotImporter {
     if (points.isEmpty) {
       return const [];
     }
+    _pruneSkeletonSpurs(points, neighborsOf);
 
     final consumed = <int>{};
     int edgeKey(int a, int b) => a < b ? a * 1000000 + b : b * 1000000 + a;
