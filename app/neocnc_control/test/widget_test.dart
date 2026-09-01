@@ -33,6 +33,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('DESENHO LIVRE / PLOTTER XY'), findsOneWidget);
+    expect(find.text('IMPORTAR IMAGEM P/B'), findsOneWidget);
+    expect(find.text('IMPORTAR SVG'), findsOneWidget);
     expect(find.text('DESENHAR NA MÁQUINA'), findsOneWidget);
   });
 }

@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/neocnc_theme.dart';
+import '../../drawing/application/plot_importer.dart';
 import '../../printer/application/printer_controller.dart';
 import '../../printer/domain/drawing_point.dart';
 import '../../printer/domain/printer_snapshot.dart';
@@ -26,8 +29,15 @@ class _CncDashboardState extends State<CncDashboard> {
   bool _mapArmed = false;
   Offset? _mapTarget;
   final List<List<Offset>> _drawingStrokes = [];
-  double _safeZ = 5;
+  double _penLiftMm = 5;
   double _drawingZ = 0;
+  double _imageThreshold = .5;
+  bool _importingDrawing = false;
+  String? _importedDrawingLabel;
+  List<List<Offset>>? _importedBaseStrokes;
+  double? _routeWidthMm;
+  double? _routeHeightMm;
+  bool _lockRouteProportions = true;
   _ControlTab _selectedTab = _ControlTab.map;
   String _printerModel = 'Ender-3 Neo / NeoCNC';
   bool _compactControls = false;
@@ -167,7 +177,13 @@ class _CncDashboardState extends State<CncDashboard> {
     if (_controller.isDrawing) {
       return;
     }
-    setState(() => _drawingStrokes.add([point]));
+    setState(() {
+      _importedBaseStrokes = null;
+      _routeWidthMm = null;
+      _routeHeightMm = null;
+      _importedDrawingLabel = null;
+      _drawingStrokes.add([point]);
+    });
   }
 
   void _extendDrawingStroke(Offset point) {
@@ -191,7 +207,124 @@ class _CncDashboardState extends State<CncDashboard> {
     if (_controller.isDrawing) {
       return;
     }
-    setState(_drawingStrokes.clear);
+    setState(() {
+      _drawingStrokes.clear();
+      _importedDrawingLabel = null;
+      _importedBaseStrokes = null;
+      _routeWidthMm = null;
+      _routeHeightMm = null;
+    });
+  }
+
+  void _resizeImportedRoute({double? width, double? height}) {
+    final baseStrokes = _importedBaseStrokes;
+    final currentWidth = _routeWidthMm;
+    final currentHeight = _routeHeightMm;
+    if (baseStrokes == null || currentWidth == null || currentHeight == null) {
+      return;
+    }
+
+    final original = PlotImporter.measure(baseStrokes);
+    var targetWidth = (width ?? currentWidth).clamp(5.0, 220.0).toDouble();
+    var targetHeight = (height ?? currentHeight).clamp(5.0, 220.0).toDouble();
+    if (_lockRouteProportions) {
+      if (width != null) {
+        targetHeight = targetWidth * original.height / original.width;
+      } else if (height != null) {
+        targetWidth = targetHeight * original.width / original.height;
+      }
+    }
+    final fit = math.min(
+      1.0,
+      math.min(220.0 / targetWidth, 220.0 / targetHeight),
+    );
+    targetWidth *= fit;
+    targetHeight *= fit;
+
+    final resized = PlotImporter.resizeAndCenter(
+      baseStrokes,
+      width: targetWidth,
+      height: targetHeight,
+    );
+    setState(() {
+      _drawingStrokes
+        ..clear()
+        ..addAll(resized);
+      _routeWidthMm = targetWidth;
+      _routeHeightMm = targetHeight;
+    });
+  }
+
+  Future<void> _importDrawing({required bool svg}) async {
+    if (_controller.isDrawing || _importingDrawing) {
+      return;
+    }
+    final file = await openFile(
+      acceptedTypeGroups: [
+        XTypeGroup(
+          label: svg ? 'SVG vetorial' : 'Imagem preto e branco',
+          extensions: svg
+              ? const ['svg']
+              : const ['png', 'jpg', 'jpeg', 'bmp', 'webp'],
+        ),
+      ],
+      confirmButtonText: 'IMPORTAR ROTA',
+    );
+    if (file == null || !mounted) {
+      return;
+    }
+    setState(() => _importingDrawing = true);
+    try {
+      final bytes = await file.readAsBytes();
+      final result = svg
+          ? PlotImporter.fromSvg(utf8.decode(bytes), label: file.name)
+          : await PlotImporter.fromMonochromeImage(
+              bytes,
+              label: file.name,
+              threshold: _imageThreshold,
+            );
+      if (!mounted) {
+        return;
+      }
+      if (_drawingStrokes.isNotEmpty) {
+        final replace = await _confirm(
+          title: 'Substituir rota atual?',
+          body:
+              '${result.label} gerou ${result.strokes.length} traço(s) e '
+              '${result.segmentCount} segmento(s).\n\nO desenho atual será substituído.',
+          accept: 'SUBSTITUIR',
+        );
+        if (!replace || !mounted) {
+          return;
+        }
+      }
+      setState(() {
+        final baseStrokes = List<List<Offset>>.unmodifiable(
+          result.strokes
+              .map((stroke) => List<Offset>.unmodifiable(stroke))
+              .toList(growable: false),
+        );
+        final dimensions = PlotImporter.measure(baseStrokes);
+        _drawingStrokes
+          ..clear()
+          ..addAll(baseStrokes.map((stroke) => List<Offset>.from(stroke)));
+        _importedDrawingLabel = result.label;
+        _importedBaseStrokes = baseStrokes;
+        _routeWidthMm = dimensions.width;
+        _routeHeightMm = dimensions.height;
+      });
+      _showMessage(
+        '${result.label} importado: ${result.segmentCount} segmentos.',
+      );
+    } catch (error) {
+      if (mounted) {
+        _showMessage('Falha ao importar: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _importingDrawing = false);
+      }
+    }
   }
 
   Future<void> _sendDrawing() async {
@@ -214,8 +347,10 @@ class _CncDashboardState extends State<CncDashboard> {
       title: 'Enviar desenho para a máquina?',
       body:
           '$strokeCount traço(s) • $segmentCount segmento(s)\n\n'
-          'A ferramenta irá para Z${_safeZ.toStringAsFixed(1)} mm entre traços '
-          'e para Z${_drawingZ.toStringAsFixed(1)} mm ao desenhar.\n\n'
+          'A caneta desenhará em Z${_drawingZ.toStringAsFixed(1)} mm e elevará '
+          '${_penLiftMm.toStringAsFixed(1)} mm entre traços '
+          '(Z${(_drawingZ + _penLiftMm).toStringAsFixed(1)} mm).\n\n'
+          'Ao concluir, o buzzer tocará uma melodia curta.\n\n'
           'Confirme que uma caneta/ferramenta está montada e que Z0 foi calibrado sobre o papel.',
       accept: 'INICIAR DESENHO',
     );
@@ -231,7 +366,7 @@ class _CncDashboardState extends State<CncDashboard> {
                   .toList(growable: false),
             )
             .toList(growable: false),
-        safeZ: _safeZ,
+        penLiftMm: _penLiftMm,
         drawingZ: _drawingZ,
         feedrateMmPerSecond: _feedrate,
       ),
@@ -498,24 +633,33 @@ class _CncDashboardState extends State<CncDashboard> {
       _ControlTab.drawing => _DrawingPanel(
         snapshot: snapshot,
         strokes: _drawingStrokes,
-        safeZ: _safeZ,
+        penLiftMm: _penLiftMm,
         drawingZ: _drawingZ,
         feedrate: _feedrate,
         fullyReferenced: _controller.isFullyReferenced,
         running: _controller.isDrawing,
         completedSegments: _controller.drawingCompletedSegments,
         segmentCount: _controller.drawingSegmentCount,
-        onSafeZChanged: (value) => setState(() {
-          _safeZ = value;
-          if (_drawingZ > value) {
-            _drawingZ = value;
-          }
-        }),
+        importing: _importingDrawing,
+        importedLabel: _importedDrawingLabel,
+        imageThreshold: _imageThreshold,
+        routeWidthMm: _routeWidthMm,
+        routeHeightMm: _routeHeightMm,
+        lockRouteProportions: _lockRouteProportions,
+        onPenLiftChanged: (value) => setState(() => _penLiftMm = value),
         onDrawingZChanged: (value) => setState(() => _drawingZ = value),
         onStrokeStart: _startDrawingStroke,
         onStrokeExtend: _extendDrawingStroke,
         onStrokeEnd: _finishDrawingStroke,
         onClear: _clearDrawing,
+        onImageThresholdChanged: (value) =>
+            setState(() => _imageThreshold = value),
+        onRouteWidthChanged: (value) => _resizeImportedRoute(width: value),
+        onRouteHeightChanged: (value) => _resizeImportedRoute(height: value),
+        onRouteProportionsLockedChanged: (value) =>
+            setState(() => _lockRouteProportions = value),
+        onImportRaster: () => _importDrawing(svg: false),
+        onImportSvg: () => _importDrawing(svg: true),
         onSend: _sendDrawing,
       ),
       _ControlTab.relativeMotion => _MotionPanel(
@@ -1283,19 +1427,31 @@ class _DrawingPanel extends StatelessWidget {
   const _DrawingPanel({
     required this.snapshot,
     required this.strokes,
-    required this.safeZ,
+    required this.penLiftMm,
     required this.drawingZ,
     required this.feedrate,
     required this.fullyReferenced,
     required this.running,
     required this.completedSegments,
     required this.segmentCount,
-    required this.onSafeZChanged,
+    required this.importing,
+    required this.importedLabel,
+    required this.imageThreshold,
+    required this.routeWidthMm,
+    required this.routeHeightMm,
+    required this.lockRouteProportions,
+    required this.onPenLiftChanged,
     required this.onDrawingZChanged,
     required this.onStrokeStart,
     required this.onStrokeExtend,
     required this.onStrokeEnd,
     required this.onClear,
+    required this.onImageThresholdChanged,
+    required this.onRouteWidthChanged,
+    required this.onRouteHeightChanged,
+    required this.onRouteProportionsLockedChanged,
+    required this.onImportRaster,
+    required this.onImportSvg,
     required this.onSend,
   });
 
@@ -1303,19 +1459,31 @@ class _DrawingPanel extends StatelessWidget {
 
   final PrinterSnapshot snapshot;
   final List<List<Offset>> strokes;
-  final double safeZ;
+  final double penLiftMm;
   final double drawingZ;
   final double feedrate;
   final bool fullyReferenced;
   final bool running;
   final int completedSegments;
   final int segmentCount;
-  final ValueChanged<double> onSafeZChanged;
+  final bool importing;
+  final String? importedLabel;
+  final double imageThreshold;
+  final double? routeWidthMm;
+  final double? routeHeightMm;
+  final bool lockRouteProportions;
+  final ValueChanged<double> onPenLiftChanged;
   final ValueChanged<double> onDrawingZChanged;
   final ValueChanged<Offset> onStrokeStart;
   final ValueChanged<Offset> onStrokeExtend;
   final VoidCallback onStrokeEnd;
   final VoidCallback onClear;
+  final ValueChanged<double> onImageThresholdChanged;
+  final ValueChanged<double> onRouteWidthChanged;
+  final ValueChanged<double> onRouteHeightChanged;
+  final ValueChanged<bool> onRouteProportionsLockedChanged;
+  final Future<void> Function() onImportRaster;
+  final Future<void> Function() onImportSvg;
   final Future<void> Function() onSend;
 
   int get _strokeCount => strokes.where((stroke) => stroke.length >= 2).length;
@@ -1324,8 +1492,25 @@ class _DrawingPanel extends StatelessWidget {
     (total, stroke) => total + math.max(0, stroke.length - 1),
   );
 
+  bool get _canResizeRoute => routeWidthMm != null && routeHeightMm != null;
+
+  double get _routeMaxWidthMm {
+    if (!_canResizeRoute || !lockRouteProportions) {
+      return 220;
+    }
+    return math.min(220.0, 220.0 * routeWidthMm! / routeHeightMm!);
+  }
+
+  double get _routeMaxHeightMm {
+    if (!_canResizeRoute || !lockRouteProportions) {
+      return 220;
+    }
+    return math.min(220.0, 220.0 * routeHeightMm! / routeWidthMm!);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final drawingLocked = running || importing;
     final progress = segmentCount == 0
         ? 0.0
         : (completedSegments / segmentCount).clamp(0.0, 1.0);
@@ -1365,9 +1550,71 @@ class _DrawingPanel extends StatelessWidget {
                     fontWeight: FontWeight.w800,
                   ),
                 ),
+              if (importing)
+                const Text(
+                  'CONVERTENDO ROTA…',
+                  style: TextStyle(
+                    color: NeoCncColors.cyan,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              if (importedLabel != null && !importing)
+                Text(
+                  importedLabel!,
+                  style: const TextStyle(
+                    color: NeoCncColors.cyan,
+                    fontSize: 12,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
+          Wrap(
+            spacing: 12,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              OutlinedButton.icon(
+                onPressed: drawingLocked
+                    ? null
+                    : () => unawaited(onImportRaster()),
+                icon: const Icon(Icons.image_search_rounded),
+                label: const Text('IMPORTAR IMAGEM P/B'),
+              ),
+              OutlinedButton.icon(
+                onPressed: drawingLocked
+                    ? null
+                    : () => unawaited(onImportSvg()),
+                icon: const Icon(Icons.account_tree_outlined),
+                label: const Text('IMPORTAR SVG'),
+              ),
+              SizedBox(
+                width: 230,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'LIMIAR P/B  ${(imageThreshold * 100).round()}%',
+                      style: const TextStyle(
+                        color: NeoCncColors.muted,
+                        fontSize: 11,
+                      ),
+                    ),
+                    Slider(
+                      value: imageThreshold,
+                      min: .1,
+                      max: .9,
+                      divisions: 80,
+                      label: '${(imageThreshold * 100).round()}%',
+                      onChanged: drawingLocked ? null : onImageThresholdChanged,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
           LayoutBuilder(
             builder: (context, constraints) {
               final side = math.min(430.0, constraints.maxWidth);
@@ -1377,7 +1624,7 @@ class _DrawingPanel extends StatelessWidget {
                   child: LayoutBuilder(
                     builder: (context, canvasConstraints) => GestureDetector(
                       behavior: HitTestBehavior.opaque,
-                      onPanStart: running
+                      onPanStart: drawingLocked
                           ? null
                           : (details) => onStrokeStart(
                               _toMachine(
@@ -1385,7 +1632,7 @@ class _DrawingPanel extends StatelessWidget {
                                 canvasConstraints.biggest,
                               ),
                             ),
-                      onPanUpdate: running
+                      onPanUpdate: drawingLocked
                           ? null
                           : (details) => onStrokeExtend(
                               _toMachine(
@@ -1393,8 +1640,8 @@ class _DrawingPanel extends StatelessWidget {
                                 canvasConstraints.biggest,
                               ),
                             ),
-                      onPanEnd: running ? null : (_) => onStrokeEnd(),
-                      onPanCancel: running ? null : onStrokeEnd,
+                      onPanEnd: drawingLocked ? null : (_) => onStrokeEnd(),
+                      onPanCancel: drawingLocked ? null : onStrokeEnd,
                       child: CustomPaint(
                         painter: _DrawingPainter(
                           strokes: strokes,
@@ -1411,6 +1658,75 @@ class _DrawingPanel extends StatelessWidget {
             },
           ),
           const SizedBox(height: 12),
+          if (_canResizeRoute) ...[
+            Wrap(
+              spacing: 18,
+              runSpacing: 10,
+              crossAxisAlignment: WrapCrossAlignment.end,
+              children: [
+                SizedBox(
+                  width: 250,
+                  child: _DrawHeightControl(
+                    label: 'LARGURA DA ROTA',
+                    value: routeWidthMm!,
+                    min: 5,
+                    max: _routeMaxWidthMm,
+                    divisions: ((_routeMaxWidthMm - 5) * 10)
+                        .round()
+                        .clamp(1, 2200)
+                        .toInt(),
+                    onChanged: drawingLocked ? null : onRouteWidthChanged,
+                  ),
+                ),
+                SizedBox(
+                  width: 250,
+                  child: _DrawHeightControl(
+                    label: 'ALTURA DA ROTA',
+                    value: routeHeightMm!,
+                    min: 5,
+                    max: _routeMaxHeightMm,
+                    divisions: ((_routeMaxHeightMm - 5) * 10)
+                        .round()
+                        .clamp(1, 2200)
+                        .toInt(),
+                    onChanged: drawingLocked ? null : onRouteHeightChanged,
+                  ),
+                ),
+                Tooltip(
+                  message: lockRouteProportions
+                      ? 'Proporção travada'
+                      : 'Proporção livre',
+                  child: OutlinedButton.icon(
+                    onPressed: drawingLocked
+                        ? null
+                        : () => onRouteProportionsLockedChanged(
+                            !lockRouteProportions,
+                          ),
+                    icon: Icon(
+                      lockRouteProportions
+                          ? Icons.lock_outline_rounded
+                          : Icons.lock_open_rounded,
+                    ),
+                    label: Text(
+                      lockRouteProportions
+                          ? 'PROPORÇÃO TRAVADA'
+                          : 'PROPORÇÃO LIVRE',
+                    ),
+                  ),
+                ),
+                Text(
+                  '${routeWidthMm!.toStringAsFixed(1)} × '
+                  '${routeHeightMm!.toStringAsFixed(1)} mm',
+                  style: const TextStyle(
+                    color: NeoCncColors.cyan,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+          ],
           if (running) ...[
             LinearProgressIndicator(value: progress),
             const SizedBox(height: 6),
@@ -1428,21 +1744,21 @@ class _DrawingPanel extends StatelessWidget {
               SizedBox(
                 width: 250,
                 child: _DrawHeightControl(
-                  label: 'Z SEGURO',
-                  value: safeZ,
-                  min: 1,
+                  label: 'ELEVAÇÃO ENTRE TRAÇOS',
+                  value: penLiftMm,
+                  min: .5,
                   max: 25,
-                  onChanged: running ? null : onSafeZChanged,
+                  onChanged: drawingLocked ? null : onPenLiftChanged,
                 ),
               ),
               SizedBox(
                 width: 250,
                 child: _DrawHeightControl(
-                  label: 'Z DE TRAÇO',
+                  label: 'Z DO PAPEL / TRAÇO',
                   value: drawingZ,
                   min: 0,
-                  max: safeZ,
-                  onChanged: running ? null : onDrawingZChanged,
+                  max: 25,
+                  onChanged: drawingLocked ? null : onDrawingZChanged,
                 ),
               ),
               Text(
@@ -1450,12 +1766,12 @@ class _DrawingPanel extends StatelessWidget {
                 style: const TextStyle(color: NeoCncColors.muted, fontSize: 11),
               ),
               OutlinedButton.icon(
-                onPressed: running || strokes.isEmpty ? null : onClear,
+                onPressed: drawingLocked || strokes.isEmpty ? null : onClear,
                 icon: const Icon(Icons.delete_outline_rounded),
                 label: const Text('LIMPAR'),
               ),
               FilledButton.icon(
-                onPressed: running || _strokeCount == 0
+                onPressed: drawingLocked || _strokeCount == 0
                     ? null
                     : () => unawaited(onSend()),
                 icon: const Icon(Icons.play_arrow_rounded),
@@ -1465,7 +1781,7 @@ class _DrawingPanel extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           const Text(
-            'Modo caneta: G0 sobe e reposiciona; G1 percorre o traço. Não extruda filamento. Calibre Z0 sobre o papel antes de iniciar.',
+            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste largura e altura até 220 × 220 mm; a rota fica centralizada na mesa. Entre traços a caneta sobe a elevação configurada; ao terminar, o buzzer toca uma melodia de cerca de 2 segundos.',
             style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
           ),
         ],
@@ -1490,6 +1806,7 @@ class _DrawHeightControl extends StatelessWidget {
     required this.min,
     required this.max,
     required this.onChanged,
+    this.divisions,
   });
 
   final String label;
@@ -1497,10 +1814,12 @@ class _DrawHeightControl extends StatelessWidget {
   final double min;
   final double max;
   final ValueChanged<double>? onChanged;
+  final int? divisions;
 
   @override
   Widget build(BuildContext context) {
-    final divisions = ((max - min) * 10).round().clamp(1, 250).toInt();
+    final calculatedDivisions =
+        divisions ?? ((max - min) * 10).round().clamp(1, 250).toInt();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1512,7 +1831,7 @@ class _DrawHeightControl extends StatelessWidget {
           value: value.clamp(min, max),
           min: min,
           max: max,
-          divisions: divisions,
+          divisions: calculatedDivisions,
           label: '${value.toStringAsFixed(1)} mm',
           onChanged: onChanged,
         ),

@@ -230,15 +230,24 @@ class PrinterController extends ChangeNotifier {
 
   Future<void> draw({
     required List<List<DrawingPoint>> strokes,
-    required double safeZ,
+    required double penLiftMm,
     required double drawingZ,
     required double feedrateMmPerSecond,
   }) async {
     if (!isFullyReferenced) {
       throw StateError('Faça HOME XY e HOME Z antes de desenhar.');
     }
-    if (safeZ < 0 || safeZ > 250 || drawingZ < 0 || drawingZ > safeZ) {
-      throw ArgumentError('Configure Z seguro acima ou igual ao Z de traço.');
+    if (penLiftMm <= 0 ||
+        penLiftMm > 250 ||
+        drawingZ < 0 ||
+        drawingZ > 250) {
+      throw ArgumentError(
+        'Configure a elevação e o Z de traço dentro do curso.',
+      );
+    }
+    final travelZ = drawingZ + penLiftMm;
+    if (travelZ > 250) {
+      throw ArgumentError('Z de traço + elevação não pode ultrapassar 250 mm.');
     }
     if (feedrateMmPerSecond <= 0 || feedrateMmPerSecond > 300) {
       throw ArgumentError.value(
@@ -280,7 +289,7 @@ class PrinterController extends ChangeNotifier {
         await _sendAndAwait('G90');
         await _setLcdMessage('NeoCNC: Desenhando');
         await _sendAndAwait(
-          'G0 Z${_formatNumber(safeZ)} F$zFeedrate',
+          'G0 Z${_formatNumber(travelZ)} F$zFeedrate',
           timeout: const Duration(seconds: 30),
         );
         try {
@@ -303,12 +312,17 @@ class PrinterController extends ChangeNotifier {
               _notify();
             }
             await _sendAndAwait(
-              'G0 Z${_formatNumber(safeZ)} F$zFeedrate',
+              'G0 Z${_formatNumber(travelZ)} F$zFeedrate',
               timeout: const Duration(seconds: 30),
             );
           }
+          await _sendAndAwait(
+            'M400',
+            timeout: const Duration(minutes: 10),
+          );
           await _sendAndAwait('M114');
           await _setLcdMessage('NeoCNC: Desenho OK');
+          await _playCompletionTune();
         } catch (_) {
           await _setLcdMessage('NeoCNC: Desenho ERRO');
           rethrow;
@@ -376,6 +390,26 @@ class PrinterController extends ChangeNotifier {
       await _sendAndAwait('M117 $message', timeout: const Duration(seconds: 3));
     } catch (error) {
       _addLog('WARN > LCD sem M117: $error');
+      _notify();
+    }
+  }
+
+  Future<void> _playCompletionTune() async {
+    const tune = <({int frequency, int duration})>[
+      (frequency: 523, duration: 300),
+      (frequency: 659, duration: 300),
+      (frequency: 784, duration: 300),
+      (frequency: 1047, duration: 900),
+    ];
+    try {
+      for (final tone in tune) {
+        await _sendAndAwait(
+          'M300 S${tone.frequency} P${tone.duration}',
+          timeout: const Duration(seconds: 5),
+        );
+      }
+    } catch (error) {
+      _addLog('WARN > Não foi possível tocar a melodia: $error');
       _notify();
     }
   }

@@ -6,7 +6,7 @@ import 'package:neocnc_control/features/printer/data/printer_transport.dart';
 import 'package:neocnc_control/features/printer/domain/drawing_point.dart';
 
 void main() {
-  test('envia um traço com Z seguro e movimentos G1', () async {
+  test('eleva a caneta entre traços e toca a melodia ao concluir', () async {
     final transport = _AutoAckTransport();
     final controller = PrinterController(transport: transport);
     addTearDown(controller.dispose);
@@ -17,8 +17,8 @@ void main() {
       strokes: const [
         [DrawingPoint(x: 10, y: 10), DrawingPoint(x: 20, y: 10)],
       ],
-      safeZ: 5,
-      drawingZ: 0,
+      penLiftMm: 3,
+      drawingZ: 2,
       feedrateMmPerSecond: 40,
     );
 
@@ -30,10 +30,15 @@ void main() {
         'M117 NeoCNC: Desenhando',
         'G0 Z5 F1200',
         'G0 X10 Y10 F2400',
-        'G1 Z0 F1200',
+        'G1 Z2 F1200',
         'G1 X20 Y10 F2400',
         'G0 Z5 F1200',
+        'M400',
         'M117 NeoCNC: Desenho OK',
+        'M300 S523 P300',
+        'M300 S659 P300',
+        'M300 S784 P300',
+        'M300 S1047 P900',
       ]),
     );
   });
