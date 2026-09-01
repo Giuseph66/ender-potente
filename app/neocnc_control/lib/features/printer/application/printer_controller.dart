@@ -7,6 +7,8 @@ import '../data/usb_serial_transport.dart';
 import '../domain/drawing_point.dart';
 import '../domain/printer_snapshot.dart';
 
+enum CompletionSound { none, discreet, melody }
+
 class PrinterController extends ChangeNotifier {
   PrinterController({PrinterTransport? transport})
     : _transport = transport ?? UsbSerialTransport() {
@@ -233,6 +235,7 @@ class PrinterController extends ChangeNotifier {
     required double penLiftMm,
     required double drawingZ,
     required double feedrateMmPerSecond,
+    required CompletionSound completionSound,
   }) async {
     if (!isFullyReferenced) {
       throw StateError('Faça HOME XY e HOME Z antes de desenhar.');
@@ -322,7 +325,7 @@ class PrinterController extends ChangeNotifier {
           );
           await _sendAndAwait('M114');
           await _setLcdMessage('NeoCNC: Desenho OK');
-          await _playCompletionTune();
+          await _playCompletionSound(completionSound);
         } catch (_) {
           await _setLcdMessage('NeoCNC: Desenho ERRO');
           rethrow;
@@ -394,13 +397,22 @@ class PrinterController extends ChangeNotifier {
     }
   }
 
-  Future<void> _playCompletionTune() async {
-    const tune = <({int frequency, int duration})>[
-      (frequency: 523, duration: 300),
-      (frequency: 659, duration: 300),
-      (frequency: 784, duration: 300),
-      (frequency: 1047, duration: 900),
-    ];
+  Future<void> _playCompletionSound(CompletionSound sound) async {
+    final tune = switch (sound) {
+      CompletionSound.none => const <({int frequency, int duration})>[],
+      CompletionSound.discreet => const <({int frequency, int duration})>[
+        (frequency: 880, duration: 100),
+      ],
+      CompletionSound.melody => const <({int frequency, int duration})>[
+        (frequency: 523, duration: 300),
+        (frequency: 659, duration: 300),
+        (frequency: 784, duration: 300),
+        (frequency: 1047, duration: 900),
+      ],
+    };
+    if (tune.isEmpty) {
+      return;
+    }
     try {
       for (final tone in tune) {
         await _sendAndAwait(

@@ -20,6 +20,7 @@ void main() {
       penLiftMm: 3,
       drawingZ: 2,
       feedrateMmPerSecond: 40,
+      completionSound: CompletionSound.melody,
     );
 
     expect(

@@ -13,6 +13,12 @@ import '../../printer/domain/printer_snapshot.dart';
 
 enum _ControlTab { map, drawing, relativeMotion, logs }
 
+String _completionSoundLabel(CompletionSound sound) => switch (sound) {
+  CompletionSound.none => 'SEM SOM',
+  CompletionSound.discreet => 'BIP CURTO',
+  CompletionSound.melody => 'MELODIA',
+};
+
 class CncDashboard extends StatefulWidget {
   const CncDashboard({super.key});
 
@@ -31,6 +37,7 @@ class _CncDashboardState extends State<CncDashboard> {
   final List<List<Offset>> _drawingStrokes = [];
   double _penLiftMm = 5;
   double _drawingZ = 0;
+  CompletionSound _completionSound = CompletionSound.discreet;
   double _imageThreshold = .5;
   bool _importingDrawing = false;
   String? _importedDrawingLabel;
@@ -350,7 +357,7 @@ class _CncDashboardState extends State<CncDashboard> {
           'A caneta desenhará em Z${_drawingZ.toStringAsFixed(1)} mm e elevará '
           '${_penLiftMm.toStringAsFixed(1)} mm entre traços '
           '(Z${(_drawingZ + _penLiftMm).toStringAsFixed(1)} mm).\n\n'
-          'Ao concluir, o buzzer tocará uma melodia curta.\n\n'
+          'Som ao concluir: ${_completionSoundLabel(_completionSound)}.\n\n'
           'Confirme que uma caneta/ferramenta está montada e que Z0 foi calibrado sobre o papel.',
       accept: 'INICIAR DESENHO',
     );
@@ -369,6 +376,7 @@ class _CncDashboardState extends State<CncDashboard> {
         penLiftMm: _penLiftMm,
         drawingZ: _drawingZ,
         feedrateMmPerSecond: _feedrate,
+        completionSound: _completionSound,
       ),
     );
   }
@@ -643,11 +651,14 @@ class _CncDashboardState extends State<CncDashboard> {
         importing: _importingDrawing,
         importedLabel: _importedDrawingLabel,
         imageThreshold: _imageThreshold,
+        completionSound: _completionSound,
         routeWidthMm: _routeWidthMm,
         routeHeightMm: _routeHeightMm,
         lockRouteProportions: _lockRouteProportions,
         onPenLiftChanged: (value) => setState(() => _penLiftMm = value),
         onDrawingZChanged: (value) => setState(() => _drawingZ = value),
+        onCompletionSoundChanged: (sound) =>
+            setState(() => _completionSound = sound),
         onStrokeStart: _startDrawingStroke,
         onStrokeExtend: _extendDrawingStroke,
         onStrokeEnd: _finishDrawingStroke,
@@ -1437,11 +1448,13 @@ class _DrawingPanel extends StatelessWidget {
     required this.importing,
     required this.importedLabel,
     required this.imageThreshold,
+    required this.completionSound,
     required this.routeWidthMm,
     required this.routeHeightMm,
     required this.lockRouteProportions,
     required this.onPenLiftChanged,
     required this.onDrawingZChanged,
+    required this.onCompletionSoundChanged,
     required this.onStrokeStart,
     required this.onStrokeExtend,
     required this.onStrokeEnd,
@@ -1469,11 +1482,13 @@ class _DrawingPanel extends StatelessWidget {
   final bool importing;
   final String? importedLabel;
   final double imageThreshold;
+  final CompletionSound completionSound;
   final double? routeWidthMm;
   final double? routeHeightMm;
   final bool lockRouteProportions;
   final ValueChanged<double> onPenLiftChanged;
   final ValueChanged<double> onDrawingZChanged;
+  final ValueChanged<CompletionSound> onCompletionSoundChanged;
   final ValueChanged<Offset> onStrokeStart;
   final ValueChanged<Offset> onStrokeExtend;
   final VoidCallback onStrokeEnd;
@@ -1761,6 +1776,31 @@ class _DrawingPanel extends StatelessWidget {
                   onChanged: drawingLocked ? null : onDrawingZChanged,
                 ),
               ),
+              SizedBox(
+                width: 210,
+                child: DropdownButtonFormField<CompletionSound>(
+                  value: completionSound,
+                  isDense: true,
+                  decoration: const InputDecoration(
+                    labelText: 'SOM AO CONCLUIR',
+                  ),
+                  items: CompletionSound.values
+                      .map(
+                        (sound) => DropdownMenuItem(
+                          value: sound,
+                          child: Text(_completionSoundLabel(sound)),
+                        ),
+                      )
+                      .toList(growable: false),
+                  onChanged: drawingLocked
+                      ? null
+                      : (sound) {
+                          if (sound != null) {
+                            onCompletionSoundChanged(sound);
+                          }
+                        },
+                ),
+              ),
               Text(
                 'XY  ${feedrate.round()} mm/s\nZ  até 20 mm/s',
                 style: const TextStyle(color: NeoCncColors.muted, fontSize: 11),
@@ -1781,7 +1821,7 @@ class _DrawingPanel extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           const Text(
-            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste largura e altura até 220 × 220 mm; a rota fica centralizada na mesa. Entre traços a caneta sobe a elevação configurada; ao terminar, o buzzer toca uma melodia de cerca de 2 segundos.',
+            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste largura e altura até 220 × 220 mm; a rota fica centralizada na mesa. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
             style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
           ),
         ],
