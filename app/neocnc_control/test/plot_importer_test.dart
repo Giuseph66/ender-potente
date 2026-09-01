@@ -107,6 +107,24 @@ void main() {
     }
   });
 
+  test('modo centro reduz uma forma preenchida a uma linha central', () {
+    final outline = PlotImporter.fromSvg('''
+        <svg viewBox="0 0 200 20">
+          <rect x="0" y="5" width="200" height="10" />
+        </svg>
+      ''', label: 'capsula.svg');
+    final centerline = PlotImporter.fromSvg('''
+        <svg viewBox="0 0 200 20">
+          <rect x="0" y="5" width="200" height="10" />
+        </svg>
+      ''', label: 'capsula.svg', mode: SvgTraceMode.centerline);
+
+    expect(centerline.strokes, isNotEmpty);
+    final centerHeight = PlotImporter.measure(centerline.strokes).height;
+    final outlineHeight = PlotImporter.measure(outline.strokes).height;
+    expect(centerHeight, lessThan(outlineHeight));
+  });
+
   test('extrai o contorno de uma área preta da imagem', () async {
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder)

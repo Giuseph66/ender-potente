@@ -41,6 +41,7 @@ class _CncDashboardState extends State<CncDashboard> {
   double _drawingZ = 0;
   CompletionSound _completionSound = CompletionSound.discreet;
   double _imageThreshold = .5;
+  SvgTraceMode _svgTraceMode = SvgTraceMode.outline;
   bool _importingDrawing = false;
   String? _importedDrawingLabel;
   List<List<Offset>>? _importedBaseStrokes;
@@ -336,7 +337,11 @@ class _CncDashboardState extends State<CncDashboard> {
     try {
       final bytes = await file.readAsBytes();
       final result = svg
-          ? PlotImporter.fromSvg(utf8.decode(bytes), label: file.name)
+          ? PlotImporter.fromSvg(
+              utf8.decode(bytes),
+              label: file.name,
+              mode: _svgTraceMode,
+            )
           : await PlotImporter.fromMonochromeImage(
               bytes,
               label: file.name,
@@ -717,6 +722,7 @@ class _CncDashboardState extends State<CncDashboard> {
         importing: _importingDrawing,
         importedLabel: _importedDrawingLabel,
         imageThreshold: _imageThreshold,
+        svgTraceMode: _svgTraceMode,
         completionSound: _completionSound,
         routeWidthMm: _routeWidthMm,
         routeHeightMm: _routeHeightMm,
@@ -734,6 +740,8 @@ class _CncDashboardState extends State<CncDashboard> {
         onClear: _clearDrawing,
         onImageThresholdChanged: (value) =>
             setState(() => _imageThreshold = value),
+        onSvgTraceModeChanged: (mode) =>
+            setState(() => _svgTraceMode = mode),
         onRouteWidthChanged: (value) => _transformImportedRoute(width: value),
         onRouteHeightChanged: (value) =>
             _transformImportedRoute(height: value),
@@ -1529,6 +1537,7 @@ class _DrawingPanel extends StatelessWidget {
     required this.importing,
     required this.importedLabel,
     required this.imageThreshold,
+    required this.svgTraceMode,
     required this.completionSound,
     required this.routeWidthMm,
     required this.routeHeightMm,
@@ -1544,6 +1553,7 @@ class _DrawingPanel extends StatelessWidget {
     required this.onStrokeEnd,
     required this.onClear,
     required this.onImageThresholdChanged,
+    required this.onSvgTraceModeChanged,
     required this.onRouteWidthChanged,
     required this.onRouteHeightChanged,
     required this.onRouteRotationChanged,
@@ -1571,6 +1581,7 @@ class _DrawingPanel extends StatelessWidget {
   final bool importing;
   final String? importedLabel;
   final double imageThreshold;
+  final SvgTraceMode svgTraceMode;
   final CompletionSound completionSound;
   final double? routeWidthMm;
   final double? routeHeightMm;
@@ -1586,6 +1597,7 @@ class _DrawingPanel extends StatelessWidget {
   final VoidCallback onStrokeEnd;
   final VoidCallback onClear;
   final ValueChanged<double> onImageThresholdChanged;
+  final ValueChanged<SvgTraceMode> onSvgTraceModeChanged;
   final ValueChanged<double> onRouteWidthChanged;
   final ValueChanged<double> onRouteHeightChanged;
   final ValueChanged<double> onRouteRotationChanged;
@@ -1714,6 +1726,40 @@ class _DrawingPanel extends StatelessWidget {
                     : () => unawaited(onImportSvg()),
                 icon: const Icon(Icons.account_tree_outlined),
                 label: const Text('IMPORTAR SVG'),
+              ),
+              SizedBox(
+                width: 230,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'TRAÇO DO SVG',
+                      style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
+                    ),
+                    const SizedBox(height: 4),
+                    SegmentedButton<SvgTraceMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: SvgTraceMode.outline,
+                          label: Text('BORDA'),
+                          tooltip:
+                              'Desenha o contorno de cada forma preenchida do SVG.',
+                        ),
+                        ButtonSegment(
+                          value: SvgTraceMode.centerline,
+                          label: Text('CENTRO'),
+                          tooltip:
+                              'Reduz cada forma preenchida à linha central (esqueleto).',
+                        ),
+                      ],
+                      selected: {svgTraceMode},
+                      onSelectionChanged: drawingLocked
+                          ? null
+                          : (selection) =>
+                              onSvgTraceModeChanged(selection.first),
+                    ),
+                  ],
+                ),
               ),
               SizedBox(
                 width: 230,
