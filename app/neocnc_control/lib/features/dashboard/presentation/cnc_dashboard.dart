@@ -44,6 +44,7 @@ class _CncDashboardState extends State<CncDashboard> {
   List<List<Offset>>? _importedBaseStrokes;
   double? _routeWidthMm;
   double? _routeHeightMm;
+  double _routeRotationDegrees = 0;
   bool _lockRouteProportions = true;
   _ControlTab _selectedTab = _ControlTab.map;
   String _printerModel = 'Ender-3 Neo / NeoCNC';
@@ -188,6 +189,7 @@ class _CncDashboardState extends State<CncDashboard> {
       _importedBaseStrokes = null;
       _routeWidthMm = null;
       _routeHeightMm = null;
+      _routeRotationDegrees = 0;
       _importedDrawingLabel = null;
       _drawingStrokes.add([point]);
     });
@@ -220,10 +222,15 @@ class _CncDashboardState extends State<CncDashboard> {
       _importedBaseStrokes = null;
       _routeWidthMm = null;
       _routeHeightMm = null;
+      _routeRotationDegrees = 0;
     });
   }
 
-  void _resizeImportedRoute({double? width, double? height}) {
+  void _transformImportedRoute({
+    double? width,
+    double? height,
+    double? rotationDegrees,
+  }) {
     final baseStrokes = _importedBaseStrokes;
     final currentWidth = _routeWidthMm;
     final currentHeight = _routeHeightMm;
@@ -234,6 +241,8 @@ class _CncDashboardState extends State<CncDashboard> {
     final original = PlotImporter.measure(baseStrokes);
     var targetWidth = (width ?? currentWidth).clamp(5.0, 220.0).toDouble();
     var targetHeight = (height ?? currentHeight).clamp(5.0, 220.0).toDouble();
+    final targetRotation =
+        (rotationDegrees ?? _routeRotationDegrees).clamp(0.0, 360.0).toDouble();
     if (_lockRouteProportions) {
       if (width != null) {
         targetHeight = targetWidth * original.height / original.width;
@@ -248,17 +257,19 @@ class _CncDashboardState extends State<CncDashboard> {
     targetWidth *= fit;
     targetHeight *= fit;
 
-    final resized = PlotImporter.resizeAndCenter(
+    final transformed = PlotImporter.resizeRotateAndCenter(
       baseStrokes,
       width: targetWidth,
       height: targetHeight,
+      rotationDegrees: targetRotation,
     );
     setState(() {
       _drawingStrokes
         ..clear()
-        ..addAll(resized);
+        ..addAll(transformed);
       _routeWidthMm = targetWidth;
       _routeHeightMm = targetHeight;
+      _routeRotationDegrees = targetRotation;
     });
   }
 
@@ -319,6 +330,7 @@ class _CncDashboardState extends State<CncDashboard> {
         _importedBaseStrokes = baseStrokes;
         _routeWidthMm = dimensions.width;
         _routeHeightMm = dimensions.height;
+        _routeRotationDegrees = 0;
       });
       _showMessage(
         '${result.label} importado: ${result.segmentCount} segmentos.',
@@ -654,6 +666,7 @@ class _CncDashboardState extends State<CncDashboard> {
         completionSound: _completionSound,
         routeWidthMm: _routeWidthMm,
         routeHeightMm: _routeHeightMm,
+        routeRotationDegrees: _routeRotationDegrees,
         lockRouteProportions: _lockRouteProportions,
         onPenLiftChanged: (value) => setState(() => _penLiftMm = value),
         onDrawingZChanged: (value) => setState(() => _drawingZ = value),
@@ -665,8 +678,11 @@ class _CncDashboardState extends State<CncDashboard> {
         onClear: _clearDrawing,
         onImageThresholdChanged: (value) =>
             setState(() => _imageThreshold = value),
-        onRouteWidthChanged: (value) => _resizeImportedRoute(width: value),
-        onRouteHeightChanged: (value) => _resizeImportedRoute(height: value),
+        onRouteWidthChanged: (value) => _transformImportedRoute(width: value),
+        onRouteHeightChanged: (value) =>
+            _transformImportedRoute(height: value),
+        onRouteRotationChanged: (value) =>
+            _transformImportedRoute(rotationDegrees: value),
         onRouteProportionsLockedChanged: (value) =>
             setState(() => _lockRouteProportions = value),
         onImportRaster: () => _importDrawing(svg: false),
@@ -1451,6 +1467,7 @@ class _DrawingPanel extends StatelessWidget {
     required this.completionSound,
     required this.routeWidthMm,
     required this.routeHeightMm,
+    required this.routeRotationDegrees,
     required this.lockRouteProportions,
     required this.onPenLiftChanged,
     required this.onDrawingZChanged,
@@ -1462,6 +1479,7 @@ class _DrawingPanel extends StatelessWidget {
     required this.onImageThresholdChanged,
     required this.onRouteWidthChanged,
     required this.onRouteHeightChanged,
+    required this.onRouteRotationChanged,
     required this.onRouteProportionsLockedChanged,
     required this.onImportRaster,
     required this.onImportSvg,
@@ -1485,6 +1503,7 @@ class _DrawingPanel extends StatelessWidget {
   final CompletionSound completionSound;
   final double? routeWidthMm;
   final double? routeHeightMm;
+  final double routeRotationDegrees;
   final bool lockRouteProportions;
   final ValueChanged<double> onPenLiftChanged;
   final ValueChanged<double> onDrawingZChanged;
@@ -1496,6 +1515,7 @@ class _DrawingPanel extends StatelessWidget {
   final ValueChanged<double> onImageThresholdChanged;
   final ValueChanged<double> onRouteWidthChanged;
   final ValueChanged<double> onRouteHeightChanged;
+  final ValueChanged<double> onRouteRotationChanged;
   final ValueChanged<bool> onRouteProportionsLockedChanged;
   final Future<void> Function() onImportRaster;
   final Future<void> Function() onImportSvg;
@@ -1707,6 +1727,31 @@ class _DrawingPanel extends StatelessWidget {
                     onChanged: drawingLocked ? null : onRouteHeightChanged,
                   ),
                 ),
+                SizedBox(
+                  width: 250,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'ROTAÇÃO  ${routeRotationDegrees.round()}°',
+                        style: const TextStyle(
+                          color: NeoCncColors.muted,
+                          fontSize: 11,
+                        ),
+                      ),
+                      Slider(
+                        value: routeRotationDegrees,
+                        min: 0,
+                        max: 360,
+                        divisions: 360,
+                        label: '${routeRotationDegrees.round()}°',
+                        onChanged: drawingLocked
+                            ? null
+                            : onRouteRotationChanged,
+                      ),
+                    ],
+                  ),
+                ),
                 Tooltip(
                   message: lockRouteProportions
                       ? 'Proporção travada'
@@ -1821,7 +1866,7 @@ class _DrawingPanel extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           const Text(
-            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste largura e altura até 220 × 220 mm; a rota fica centralizada na mesa. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
+            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste tamanho e rotação; a rota fica centralizada e, se necessário, reduzida para caber nos 220 × 220 mm da mesa. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
             style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
           ),
         ],

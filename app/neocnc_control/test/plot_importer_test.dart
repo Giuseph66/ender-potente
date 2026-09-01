@@ -46,6 +46,29 @@ void main() {
     }
   });
 
+  test('rotaciona uma rota importada e a mantém dentro da mesa', () {
+    const route = [
+      [ui.Offset(0, 0), ui.Offset(100, 0), ui.Offset(100, 50)],
+    ];
+
+    final rotated = PlotImporter.resizeRotateAndCenter(
+      route,
+      width: 200,
+      height: 100,
+      rotationDegrees: 90,
+    );
+    final dimensions = PlotImporter.measure(rotated);
+
+    expect(dimensions.width, closeTo(100, .001));
+    expect(dimensions.height, closeTo(200, .001));
+    for (final stroke in rotated) {
+      for (final point in stroke) {
+        expect(point.dx, inInclusiveRange(60.0, 160.0));
+        expect(point.dy, inInclusiveRange(10.0, 210.0));
+      }
+    }
+  });
+
   test('extrai o contorno de uma área preta da imagem', () async {
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder)

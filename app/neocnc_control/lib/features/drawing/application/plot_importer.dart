@@ -49,9 +49,28 @@ abstract final class PlotImporter {
     List<List<ui.Offset>> strokes, {
     required double width,
     required double height,
+  }) => resizeRotateAndCenter(
+    strokes,
+    width: width,
+    height: height,
+    rotationDegrees: 0,
+  );
+
+  static List<List<ui.Offset>> resizeRotateAndCenter(
+    List<List<ui.Offset>> strokes, {
+    required double width,
+    required double height,
+    required double rotationDegrees,
   }) {
     if (width <= 0 || height <= 0 || width > _bedSize || height > _bedSize) {
       throw ArgumentError('O tamanho da rota deve ficar entre 0 e 220 mm.');
+    }
+    if (!rotationDegrees.isFinite) {
+      throw ArgumentError.value(
+        rotationDegrees,
+        'rotationDegrees',
+        'A rotação deve ser um número válido.',
+      );
     }
     final bounds = _boundsOf(strokes);
     final sourceWidth = math.max(.1, bounds.width);
@@ -60,16 +79,41 @@ abstract final class PlotImporter {
       (bounds.minX + bounds.maxX) / 2,
       (bounds.minY + bounds.maxY) / 2,
     );
+    final radians = rotationDegrees * math.pi / 180;
+    final cosine = math.cos(radians);
+    final sine = math.sin(radians);
+    final rotated = strokes
+        .map(
+          (stroke) => stroke
+              .map((point) {
+                final x = (point.dx - sourceCenter.dx) * width / sourceWidth;
+                final y = (point.dy - sourceCenter.dy) * height / sourceHeight;
+                return ui.Offset(x * cosine - y * sine, x * sine + y * cosine);
+              })
+              .toList(growable: false),
+        )
+        .toList(growable: false);
+    final rotatedBounds = _boundsOf(rotated);
+    final fit = math.min(
+      1.0,
+      math.min(
+        _bedSize / math.max(.1, rotatedBounds.width),
+        _bedSize / math.max(.1, rotatedBounds.height),
+      ),
+    );
+    final rotatedCenter = ui.Offset(
+      (rotatedBounds.minX + rotatedBounds.maxX) / 2,
+      (rotatedBounds.minY + rotatedBounds.maxY) / 2,
+    );
     const bedCenter = _bedSize / 2;
 
-    return strokes
+    return rotated
         .map(
           (stroke) => stroke
               .map(
                 (point) => ui.Offset(
-                  bedCenter + (point.dx - sourceCenter.dx) * width / sourceWidth,
-                  bedCenter +
-                      (point.dy - sourceCenter.dy) * height / sourceHeight,
+                  bedCenter + (point.dx - rotatedCenter.dx) * fit,
+                  bedCenter + (point.dy - rotatedCenter.dy) * fit,
                 ),
               )
               .toList(growable: false),
