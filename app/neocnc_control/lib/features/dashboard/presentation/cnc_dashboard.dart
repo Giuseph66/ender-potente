@@ -27,6 +27,8 @@ class CncDashboard extends StatefulWidget {
 }
 
 class _CncDashboardState extends State<CncDashboard> {
+  static const _initialImportLongestSideMm = 100.0;
+
   late final PrinterController _controller;
   final TextEditingController _commandController = TextEditingController();
   String? _selectedPort;
@@ -45,6 +47,8 @@ class _CncDashboardState extends State<CncDashboard> {
   double? _routeWidthMm;
   double? _routeHeightMm;
   double _routeRotationDegrees = 0;
+  double _routeCenterX = 110;
+  double _routeCenterY = 110;
   bool _lockRouteProportions = true;
   _ControlTab _selectedTab = _ControlTab.map;
   String _printerModel = 'Ender-3 Neo / NeoCNC';
@@ -190,6 +194,8 @@ class _CncDashboardState extends State<CncDashboard> {
       _routeWidthMm = null;
       _routeHeightMm = null;
       _routeRotationDegrees = 0;
+      _routeCenterX = 110;
+      _routeCenterY = 110;
       _importedDrawingLabel = null;
       _drawingStrokes.add([point]);
     });
@@ -223,6 +229,8 @@ class _CncDashboardState extends State<CncDashboard> {
       _routeWidthMm = null;
       _routeHeightMm = null;
       _routeRotationDegrees = 0;
+      _routeCenterX = 110;
+      _routeCenterY = 110;
     });
   }
 
@@ -230,6 +238,8 @@ class _CncDashboardState extends State<CncDashboard> {
     double? width,
     double? height,
     double? rotationDegrees,
+    double? centerX,
+    double? centerY,
   }) {
     final baseStrokes = _importedBaseStrokes;
     final currentWidth = _routeWidthMm;
@@ -257,11 +267,27 @@ class _CncDashboardState extends State<CncDashboard> {
     targetWidth *= fit;
     targetHeight *= fit;
 
+    final centered = PlotImporter.resizeRotateAndCenter(
+      baseStrokes,
+      width: targetWidth,
+      height: targetHeight,
+      rotationDegrees: targetRotation,
+    );
+    final footprint = PlotImporter.measure(centered);
+    final halfWidth = (footprint.width / 2).clamp(0.0, 110.0).toDouble();
+    final halfHeight = (footprint.height / 2).clamp(0.0, 110.0).toDouble();
+    final targetCenterX =
+        (centerX ?? _routeCenterX).clamp(halfWidth, 220.0 - halfWidth).toDouble();
+    final targetCenterY =
+        (centerY ?? _routeCenterY)
+            .clamp(halfHeight, 220.0 - halfHeight)
+            .toDouble();
     final transformed = PlotImporter.resizeRotateAndCenter(
       baseStrokes,
       width: targetWidth,
       height: targetHeight,
       rotationDegrees: targetRotation,
+      center: Offset(targetCenterX, targetCenterY),
     );
     setState(() {
       _drawingStrokes
@@ -270,7 +296,22 @@ class _CncDashboardState extends State<CncDashboard> {
       _routeWidthMm = targetWidth;
       _routeHeightMm = targetHeight;
       _routeRotationDegrees = targetRotation;
+      _routeCenterX = targetCenterX;
+      _routeCenterY = targetCenterY;
     });
+  }
+
+  void _fitImportedRouteToBed() {
+    final baseStrokes = _importedBaseStrokes;
+    if (baseStrokes == null) {
+      return;
+    }
+    final dimensions = PlotImporter.measure(baseStrokes);
+    final scale = 220.0 / math.max(dimensions.width, dimensions.height);
+    _transformImportedRoute(
+      width: dimensions.width * scale,
+      height: dimensions.height * scale,
+    );
   }
 
   Future<void> _importDrawing({required bool svg}) async {
@@ -323,14 +364,27 @@ class _CncDashboardState extends State<CncDashboard> {
               .toList(growable: false),
         );
         final dimensions = PlotImporter.measure(baseStrokes);
+        final initialScale =
+            _initialImportLongestSideMm /
+            math.max(dimensions.width, dimensions.height);
+        final initialWidth = dimensions.width * initialScale;
+        final initialHeight = dimensions.height * initialScale;
+        final initialRoute = PlotImporter.resizeRotateAndCenter(
+          baseStrokes,
+          width: initialWidth,
+          height: initialHeight,
+          rotationDegrees: 0,
+        );
         _drawingStrokes
           ..clear()
-          ..addAll(baseStrokes.map((stroke) => List<Offset>.from(stroke)));
+          ..addAll(initialRoute);
         _importedDrawingLabel = result.label;
         _importedBaseStrokes = baseStrokes;
-        _routeWidthMm = dimensions.width;
-        _routeHeightMm = dimensions.height;
+        _routeWidthMm = initialWidth;
+        _routeHeightMm = initialHeight;
         _routeRotationDegrees = 0;
+        _routeCenterX = 110;
+        _routeCenterY = 110;
       });
       _showMessage(
         '${result.label} importado: ${result.segmentCount} segmentos.',
@@ -667,6 +721,8 @@ class _CncDashboardState extends State<CncDashboard> {
         routeWidthMm: _routeWidthMm,
         routeHeightMm: _routeHeightMm,
         routeRotationDegrees: _routeRotationDegrees,
+        routeCenterX: _routeCenterX,
+        routeCenterY: _routeCenterY,
         lockRouteProportions: _lockRouteProportions,
         onPenLiftChanged: (value) => setState(() => _penLiftMm = value),
         onDrawingZChanged: (value) => setState(() => _drawingZ = value),
@@ -683,6 +739,15 @@ class _CncDashboardState extends State<CncDashboard> {
             _transformImportedRoute(height: value),
         onRouteRotationChanged: (value) =>
             _transformImportedRoute(rotationDegrees: value),
+        onRouteCenterXChanged: (value) =>
+            _transformImportedRoute(centerX: value),
+        onRouteCenterYChanged: (value) =>
+            _transformImportedRoute(centerY: value),
+        onRouteMove: (delta) => _transformImportedRoute(
+          centerX: _routeCenterX + delta.dx,
+          centerY: _routeCenterY + delta.dy,
+        ),
+        onFitRouteToBed: _fitImportedRouteToBed,
         onRouteProportionsLockedChanged: (value) =>
             setState(() => _lockRouteProportions = value),
         onImportRaster: () => _importDrawing(svg: false),
@@ -1468,6 +1533,8 @@ class _DrawingPanel extends StatelessWidget {
     required this.routeWidthMm,
     required this.routeHeightMm,
     required this.routeRotationDegrees,
+    required this.routeCenterX,
+    required this.routeCenterY,
     required this.lockRouteProportions,
     required this.onPenLiftChanged,
     required this.onDrawingZChanged,
@@ -1480,6 +1547,10 @@ class _DrawingPanel extends StatelessWidget {
     required this.onRouteWidthChanged,
     required this.onRouteHeightChanged,
     required this.onRouteRotationChanged,
+    required this.onRouteCenterXChanged,
+    required this.onRouteCenterYChanged,
+    required this.onRouteMove,
+    required this.onFitRouteToBed,
     required this.onRouteProportionsLockedChanged,
     required this.onImportRaster,
     required this.onImportSvg,
@@ -1504,6 +1575,8 @@ class _DrawingPanel extends StatelessWidget {
   final double? routeWidthMm;
   final double? routeHeightMm;
   final double routeRotationDegrees;
+  final double routeCenterX;
+  final double routeCenterY;
   final bool lockRouteProportions;
   final ValueChanged<double> onPenLiftChanged;
   final ValueChanged<double> onDrawingZChanged;
@@ -1516,6 +1589,10 @@ class _DrawingPanel extends StatelessWidget {
   final ValueChanged<double> onRouteWidthChanged;
   final ValueChanged<double> onRouteHeightChanged;
   final ValueChanged<double> onRouteRotationChanged;
+  final ValueChanged<double> onRouteCenterXChanged;
+  final ValueChanged<double> onRouteCenterYChanged;
+  final ValueChanged<Offset> onRouteMove;
+  final VoidCallback onFitRouteToBed;
   final ValueChanged<bool> onRouteProportionsLockedChanged;
   final Future<void> Function() onImportRaster;
   final Future<void> Function() onImportSvg;
@@ -1542,6 +1619,20 @@ class _DrawingPanel extends StatelessWidget {
     }
     return math.min(220.0, 220.0 * routeHeightMm! / routeWidthMm!);
   }
+
+  double get _routeCenterMinX {
+    final width = PlotImporter.measure(strokes).width;
+    return (width / 2).clamp(0.0, _travel / 2).toDouble();
+  }
+
+  double get _routeCenterMaxX => _travel - _routeCenterMinX;
+
+  double get _routeCenterMinY {
+    final height = PlotImporter.measure(strokes).height;
+    return (height / 2).clamp(0.0, _travel / 2).toDouble();
+  }
+
+  double get _routeCenterMaxY => _travel - _routeCenterMinY;
 
   @override
   Widget build(BuildContext context) {
@@ -1659,7 +1750,7 @@ class _DrawingPanel extends StatelessWidget {
                   child: LayoutBuilder(
                     builder: (context, canvasConstraints) => GestureDetector(
                       behavior: HitTestBehavior.opaque,
-                      onPanStart: drawingLocked
+                      onPanStart: drawingLocked || _canResizeRoute
                           ? null
                           : (details) => onStrokeStart(
                               _toMachine(
@@ -1669,14 +1760,25 @@ class _DrawingPanel extends StatelessWidget {
                             ),
                       onPanUpdate: drawingLocked
                           ? null
+                          : _canResizeRoute
+                          ? (details) => onRouteMove(
+                              _toMachineDelta(
+                                details.delta,
+                                canvasConstraints.biggest,
+                              ),
+                            )
                           : (details) => onStrokeExtend(
                               _toMachine(
                                 details.localPosition,
                                 canvasConstraints.biggest,
                               ),
                             ),
-                      onPanEnd: drawingLocked ? null : (_) => onStrokeEnd(),
-                      onPanCancel: drawingLocked ? null : onStrokeEnd,
+                      onPanEnd: drawingLocked || _canResizeRoute
+                          ? null
+                          : (_) => onStrokeEnd(),
+                      onPanCancel: drawingLocked || _canResizeRoute
+                          ? null
+                          : onStrokeEnd,
                       child: CustomPaint(
                         painter: _DrawingPainter(
                           strokes: strokes,
@@ -1694,6 +1796,15 @@ class _DrawingPanel extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           if (_canResizeRoute) ...[
+            const Text(
+              'ARRASTE A ROTA NA PRÉVIA OU AJUSTE OS CONTROLES ABAIXO.',
+              style: TextStyle(
+                color: NeoCncColors.cyan,
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 8),
             Wrap(
               spacing: 18,
               runSpacing: 10,
@@ -1752,6 +1863,26 @@ class _DrawingPanel extends StatelessWidget {
                     ],
                   ),
                 ),
+                SizedBox(
+                  width: 250,
+                  child: _DrawHeightControl(
+                    label: 'CENTRO X DA ROTA',
+                    value: routeCenterX,
+                    min: _routeCenterMinX,
+                    max: _routeCenterMaxX,
+                    onChanged: drawingLocked ? null : onRouteCenterXChanged,
+                  ),
+                ),
+                SizedBox(
+                  width: 250,
+                  child: _DrawHeightControl(
+                    label: 'CENTRO Y DA ROTA',
+                    value: routeCenterY,
+                    min: _routeCenterMinY,
+                    max: _routeCenterMaxY,
+                    onChanged: drawingLocked ? null : onRouteCenterYChanged,
+                  ),
+                ),
                 Tooltip(
                   message: lockRouteProportions
                       ? 'Proporção travada'
@@ -1773,6 +1904,11 @@ class _DrawingPanel extends StatelessWidget {
                           : 'PROPORÇÃO LIVRE',
                     ),
                   ),
+                ),
+                OutlinedButton.icon(
+                  onPressed: drawingLocked ? null : onFitRouteToBed,
+                  icon: const Icon(Icons.fit_screen_rounded),
+                  label: const Text('OCUPAR A MESA'),
                 ),
                 Text(
                   '${routeWidthMm!.toStringAsFixed(1)} × '
@@ -1866,7 +2002,7 @@ class _DrawingPanel extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           const Text(
-            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Depois de importar, ajuste tamanho e rotação; a rota fica centralizada e, se necessário, reduzida para caber nos 220 × 220 mm da mesa. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
+            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Ao importar, a rota inicia em 100 mm no lado maior, sem ocupar a mesa automaticamente. Ajuste largura, altura, rotação e centro X/Y, ou use OCUPAR A MESA quando decidir preencher os 220 × 220 mm. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
             style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
           ),
         ],
@@ -1880,6 +2016,13 @@ class _DrawingPanel extends StatelessWidget {
       (_travel - local.dy / size.height * _travel)
           .clamp(0.0, _travel)
           .toDouble(),
+    );
+  }
+
+  Offset _toMachineDelta(Offset delta, Size size) {
+    return Offset(
+      delta.dx / size.width * _travel,
+      -delta.dy / size.height * _travel,
     );
   }
 }
@@ -1903,8 +2046,9 @@ class _DrawHeightControl extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final effectiveMax = math.max(max, min + .1);
     final calculatedDivisions =
-        divisions ?? ((max - min) * 10).round().clamp(1, 250).toInt();
+        divisions ?? ((effectiveMax - min) * 10).round().clamp(1, 250).toInt();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1913,12 +2057,12 @@ class _DrawHeightControl extends StatelessWidget {
           style: const TextStyle(color: NeoCncColors.muted, fontSize: 11),
         ),
         Slider(
-          value: value.clamp(min, max),
+          value: value.clamp(min, effectiveMax),
           min: min,
-          max: max,
+          max: effectiveMax,
           divisions: calculatedDivisions,
           label: '${value.toStringAsFixed(1)} mm',
-          onChanged: onChanged,
+          onChanged: max > min ? onChanged : null,
         ),
       ],
     );

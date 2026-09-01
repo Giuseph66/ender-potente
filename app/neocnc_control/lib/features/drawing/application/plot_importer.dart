@@ -61,6 +61,7 @@ abstract final class PlotImporter {
     required double width,
     required double height,
     required double rotationDegrees,
+    ui.Offset? center,
   }) {
     if (width <= 0 || height <= 0 || width > _bedSize || height > _bedSize) {
       throw ArgumentError('O tamanho da rota deve ficar entre 0 e 220 mm.');
@@ -70,6 +71,14 @@ abstract final class PlotImporter {
         rotationDegrees,
         'rotationDegrees',
         'A rotação deve ser um número válido.',
+      );
+    }
+    final targetCenter = center ?? const ui.Offset(110, 110);
+    if (!targetCenter.dx.isFinite || !targetCenter.dy.isFinite) {
+      throw ArgumentError.value(
+        center,
+        'center',
+        'A posição deve ter coordenadas válidas.',
       );
     }
     final bounds = _boundsOf(strokes);
@@ -105,15 +114,13 @@ abstract final class PlotImporter {
       (rotatedBounds.minX + rotatedBounds.maxX) / 2,
       (rotatedBounds.minY + rotatedBounds.maxY) / 2,
     );
-    const bedCenter = _bedSize / 2;
-
     return rotated
         .map(
           (stroke) => stroke
               .map(
                 (point) => ui.Offset(
-                  bedCenter + (point.dx - rotatedCenter.dx) * fit,
-                  bedCenter + (point.dy - rotatedCenter.dy) * fit,
+                  targetCenter.dx + (point.dx - rotatedCenter.dx) * fit,
+                  targetCenter.dy + (point.dy - rotatedCenter.dy) * fit,
                 ),
               )
               .toList(growable: false),
@@ -181,13 +188,14 @@ abstract final class PlotImporter {
     final document = XmlDocument.parse(source);
     final strokes = <List<ui.Offset>>[];
     for (final element in document.descendants.whereType<XmlElement>()) {
+      final elementStrokes = <List<ui.Offset>>[];
       switch (element.name.local.toLowerCase()) {
         case 'path':
           final data = element.getAttribute('d');
           if (data != null) {
             final collector = _SvgPathCollector();
             writeSvgPathDataToPath(data, collector);
-            strokes.addAll(collector.strokes);
+            elementStrokes.addAll(collector.strokes);
           }
           break;
         case 'polyline':
@@ -197,7 +205,7 @@ abstract final class PlotImporter {
             if (element.name.local.toLowerCase() == 'polygon') {
               points.add(points.first);
             }
-            strokes.add(points);
+            elementStrokes.add(points);
           }
           break;
         case 'line':
@@ -205,7 +213,7 @@ abstract final class PlotImporter {
           final y1 = _number(element.getAttribute('y1'));
           final x2 = _number(element.getAttribute('x2'));
           final y2 = _number(element.getAttribute('y2'));
-          strokes.add([ui.Offset(x1, y1), ui.Offset(x2, y2)]);
+          elementStrokes.add([ui.Offset(x1, y1), ui.Offset(x2, y2)]);
           break;
         case 'rect':
           final x = _number(element.getAttribute('x'));
@@ -213,7 +221,7 @@ abstract final class PlotImporter {
           final width = _number(element.getAttribute('width'));
           final height = _number(element.getAttribute('height'));
           if (width > 0 && height > 0) {
-            strokes.add([
+            elementStrokes.add([
               ui.Offset(x, y),
               ui.Offset(x + width, y),
               ui.Offset(x + width, y + height),
@@ -225,7 +233,7 @@ abstract final class PlotImporter {
         case 'circle':
           final radius = _number(element.getAttribute('r'));
           if (radius > 0) {
-            strokes.add(
+            elementStrokes.add(
               _ellipse(
                 _number(element.getAttribute('cx')),
                 _number(element.getAttribute('cy')),
@@ -239,7 +247,7 @@ abstract final class PlotImporter {
           final rx = _number(element.getAttribute('rx'));
           final ry = _number(element.getAttribute('ry'));
           if (rx > 0 && ry > 0) {
-            strokes.add(
+            elementStrokes.add(
               _ellipse(
                 _number(element.getAttribute('cx')),
                 _number(element.getAttribute('cy')),
@@ -250,6 +258,14 @@ abstract final class PlotImporter {
           }
           break;
       }
+      final transform = _transformForElement(element);
+      strokes.addAll(
+        elementStrokes.map(
+          (stroke) => stroke
+              .map(transform.apply)
+              .toList(growable: false),
+        ),
+      );
     }
     final paths = _fitIntoBed(strokes);
     if (paths.isEmpty) {
@@ -436,6 +452,24 @@ abstract final class PlotImporter {
     return match == null ? 0 : double.parse(match.group(0)!);
   }
 
+  static _SvgTransform _transformForElement(XmlElement element) {
+    final lineage = <XmlElement>[];
+    XmlNode? current = element;
+    while (current != null) {
+      if (current is XmlElement) {
+        lineage.add(current);
+      }
+      current = current.parent;
+    }
+    var transform = _SvgTransform.identity;
+    for (final ancestor in lineage.reversed) {
+      transform = transform.multiply(
+        _SvgTransform.parse(ancestor.getAttribute('transform')),
+      );
+    }
+    return transform;
+  }
+
   static List<ui.Offset> _simplify(List<ui.Offset> points, double tolerance) {
     if (points.length < 3) {
       return points;
@@ -495,6 +529,116 @@ abstract final class PlotImporter {
         lengthSquared;
     final closest = start + delta * ratio.clamp(0.0, 1.0);
     return (point - closest).distance;
+  }
+}
+
+class _SvgTransform {
+  const _SvgTransform(this.a, this.b, this.c, this.d, this.e, this.f);
+
+  static const identity = _SvgTransform(1, 0, 0, 1, 0, 0);
+
+  final double a;
+  final double b;
+  final double c;
+  final double d;
+  final double e;
+  final double f;
+
+  ui.Offset apply(ui.Offset point) => ui.Offset(
+    a * point.dx + c * point.dy + e,
+    b * point.dx + d * point.dy + f,
+  );
+
+  _SvgTransform multiply(_SvgTransform other) => _SvgTransform(
+    a * other.a + c * other.b,
+    b * other.a + d * other.b,
+    a * other.c + c * other.d,
+    b * other.c + d * other.d,
+    a * other.e + c * other.f + e,
+    b * other.e + d * other.f + f,
+  );
+
+  static _SvgTransform parse(String? source) {
+    var result = identity;
+    for (final match in RegExp(
+      r'([a-zA-Z]+)\s*\(([^)]*)\)',
+    ).allMatches(source ?? '')) {
+      final values = RegExp(
+        r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?',
+      )
+          .allMatches(match.group(2)!)
+          .map((number) => double.parse(number.group(0)!))
+          .toList(growable: false);
+      final transform = switch (match.group(1)!.toLowerCase()) {
+        'matrix' when values.length >= 6 => _SvgTransform(
+          values[0],
+          values[1],
+          values[2],
+          values[3],
+          values[4],
+          values[5],
+        ),
+        'translate' when values.isNotEmpty => _SvgTransform(
+          1,
+          0,
+          0,
+          1,
+          values[0],
+          values.length >= 2 ? values[1] : 0,
+        ),
+        'scale' when values.isNotEmpty => _SvgTransform(
+          values[0],
+          0,
+          0,
+          values.length >= 2 ? values[1] : values[0],
+          0,
+          0,
+        ),
+        'rotate' when values.isNotEmpty => _rotation(
+          values[0],
+          centerX: values.length >= 3 ? values[1] : 0,
+          centerY: values.length >= 3 ? values[2] : 0,
+        ),
+        'skewx' when values.isNotEmpty => _SvgTransform(
+          1,
+          0,
+          math.tan(values[0] * math.pi / 180),
+          1,
+          0,
+          0,
+        ),
+        'skewy' when values.isNotEmpty => _SvgTransform(
+          1,
+          math.tan(values[0] * math.pi / 180),
+          0,
+          1,
+          0,
+          0,
+        ),
+        _ => identity,
+      };
+      result = result.multiply(transform);
+    }
+    return result;
+  }
+
+  static _SvgTransform _rotation(
+    double degrees, {
+    required double centerX,
+    required double centerY,
+  }) {
+    final radians = degrees * math.pi / 180;
+    final rotation = _SvgTransform(
+      math.cos(radians),
+      math.sin(radians),
+      -math.sin(radians),
+      math.cos(radians),
+      0,
+      0,
+    );
+    return _SvgTransform(1, 0, 0, 1, centerX, centerY)
+        .multiply(rotation)
+        .multiply(_SvgTransform(1, 0, 0, 1, -centerX, -centerY));
   }
 }
 

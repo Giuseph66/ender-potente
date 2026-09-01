@@ -22,6 +22,23 @@ void main() {
     }
   });
 
+  test('preserva transformações dos caminhos e grupos SVG', () {
+    final result = PlotImporter.fromSvg('''
+        <svg width="500" height="300">
+          <g transform="translate(100, 40)">
+            <path d="M 0 0 L 10 0" />
+          </g>
+          <path d="M 0 0 L 10 0" transform="translate(400, 200)" />
+        </svg>
+      ''', label: 'transformado.svg');
+
+    expect(result.strokes, hasLength(2));
+    expect(
+      (result.strokes.first.first - result.strokes.last.first).distance,
+      greaterThan(100),
+    );
+  });
+
   test('redimensiona uma rota importada e a mantém centralizada', () {
     final source = PlotImporter.fromSvg('''
         <svg viewBox="0 0 100 80">
@@ -65,6 +82,27 @@ void main() {
       for (final point in stroke) {
         expect(point.dx, inInclusiveRange(60.0, 160.0));
         expect(point.dy, inInclusiveRange(10.0, 210.0));
+      }
+    }
+  });
+
+  test('posiciona uma rota importada pelo centro definido', () {
+    const route = [
+      [ui.Offset(0, 0), ui.Offset(100, 0), ui.Offset(100, 50)],
+    ];
+
+    final positioned = PlotImporter.resizeRotateAndCenter(
+      route,
+      width: 80,
+      height: 50,
+      rotationDegrees: 0,
+      center: ui.Offset(160, 60),
+    );
+
+    for (final stroke in positioned) {
+      for (final point in stroke) {
+        expect(point.dx, inInclusiveRange(120.0, 200.0));
+        expect(point.dy, inInclusiveRange(35.0, 85.0));
       }
     }
   });
