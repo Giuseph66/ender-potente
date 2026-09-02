@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/neocnc_theme.dart';
@@ -152,13 +153,7 @@ class JobPanel extends StatelessWidget {
           _JobSection(
             label: 'PREVIEW NA MESA',
             icon: Icons.grid_on_rounded,
-            child: AspectRatio(
-              aspectRatio: 1,
-              child: CustomPaint(
-                painter: _JobPreviewPainter(job: current, limits: limits),
-                child: const SizedBox.expand(),
-              ),
-            ),
+            child: _JobPreview(job: current, limits: limits),
           ),
           if (violations.isNotEmpty) ...[
             const SizedBox(height: 12),
@@ -529,91 +524,486 @@ class _JobSection extends StatelessWidget {
   }
 }
 
-class _JobPreviewPainter extends CustomPainter {
-  const _JobPreviewPainter({required this.job, required this.limits});
+/// Preview do trabalho na mesa. O corte quase sempre é bem menor que a mesa
+/// (uma placa de 40 x 30 mm ocupa 2% de uma mesa 220 x 220), então dá para
+/// enquadrar o trabalho em vez de olhar a mesa inteira.
+/// Enquadramento em milímetros de máquina: a mesa toda, ou o envelope do
+/// trabalho com uma folga em volta.
+({double minX, double minY, double maxX, double maxY}) _viewportFor(
+  GcodeJob job,
+  MachineLimits limits,
+  bool fitToJob,
+) {
+  final bounds = job.bounds;
+  if (!fitToJob || bounds.isEmpty) {
+    return (minX: 0, minY: 0, maxX: limits.maxX, maxY: limits.maxY);
+  }
+  final margin = math.max(2.0, math.max(bounds.width, bounds.height) * .14);
+  return (
+    minX: bounds.minX - margin,
+    minY: bounds.minY - margin,
+    maxX: bounds.maxX + margin,
+    maxY: bounds.maxY + margin,
+  );
+}
+
+class _JobPreview extends StatefulWidget {
+  const _JobPreview({required this.job, required this.limits});
 
   final GcodeJob job;
   final MachineLimits limits;
 
   @override
+  State<_JobPreview> createState() => _JobPreviewState();
+}
+
+class _JobPreviewState extends State<_JobPreview> {
+  bool _fitToJob = true;
+
+  double _viewAspect(bool fitToJob) {
+    final view = _viewportFor(widget.job, widget.limits, fitToJob);
+    final width = math.max(1.0, view.maxX - view.minX);
+    final height = math.max(1.0, view.maxY - view.minY);
+    // Sem extremos: uma tira muito fina viraria uma linha inútil na tela.
+    return (width / height).clamp(.6, 2.2);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canFit = !widget.job.bounds.isEmpty;
+    final fitToJob = _fitToJob && canFit;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                  value: true,
+                  icon: Icon(Icons.center_focus_strong_rounded, size: 16),
+                  label: Text('TRABALHO'),
+                ),
+                ButtonSegment(
+                  value: false,
+                  icon: Icon(Icons.grid_on_rounded, size: 16),
+                  label: Text('MESA INTEIRA'),
+                ),
+              ],
+              selected: {fitToJob},
+              onSelectionChanged: canFit
+                  ? (selection) =>
+                        setState(() => _fitToJob = selection.first)
+                  : null,
+            ),
+            const _PreviewLegend(),
+          ],
+        ),
+        const SizedBox(height: 10),
+        // A caixa acompanha a proporção do que está enquadrado: um trabalho
+        // largo e baixo não precisa de um quadrado cheio de vazio.
+        Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 460),
+            child: AspectRatio(
+              aspectRatio: _viewAspect(fitToJob),
+              child: CustomPaint(
+                painter: _JobPreviewPainter(
+                  job: widget.job,
+                  limits: widget.limits,
+                  fitToJob: fitToJob,
+                ),
+                child: const SizedBox.expand(),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _PreviewLegend extends StatelessWidget {
+  const _PreviewLegend();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Wrap(
+      spacing: 14,
+      runSpacing: 4,
+      children: [
+        _LegendItem(color: NeoCncColors.cyan, label: 'CORTE'),
+        _LegendItem(
+          color: NeoCncColors.muted,
+          label: 'DESLOCAMENTO',
+          dashed: true,
+        ),
+        _LegendItem(color: NeoCncColors.amber, label: 'ENVELOPE'),
+      ],
+    );
+  }
+}
+
+class _LegendItem extends StatelessWidget {
+  const _LegendItem({
+    required this.color,
+    required this.label,
+    this.dashed = false,
+  });
+
+  final Color color;
+  final String label;
+  final bool dashed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 16,
+          height: 2,
+          decoration: BoxDecoration(
+            color: dashed ? null : color,
+            border: dashed ? Border.all(color: color, width: 1) : null,
+          ),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          label,
+          style: const TextStyle(color: NeoCncColors.muted, fontSize: 10),
+        ),
+      ],
+    );
+  }
+}
+
+class _JobPreviewPainter extends CustomPainter {
+  const _JobPreviewPainter({
+    required this.job,
+    required this.limits,
+    required this.fitToJob,
+  });
+
+  final GcodeJob job;
+  final MachineLimits limits;
+
+  /// Enquadra o envelope do trabalho em vez da mesa inteira.
+  final bool fitToJob;
+
+  /// Passos de grade e de barra de escala que dão números redondos.
+  static const _niceSteps = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+
+  @override
   void paint(Canvas canvas, Size size) {
-    final scale = size.width / limits.maxX;
+    canvas.drawRect(Offset.zero & size, Paint()..color = NeoCncColors.canvas);
+
+    final bounds = job.bounds;
+    final view = _viewportFor(job, limits, fitToJob);
+    final viewMinX = view.minX;
+    final viewMinY = view.minY;
+    final viewMaxX = view.maxX;
+    final viewMaxY = view.maxY;
+    final viewWidth = math.max(1.0, viewMaxX - viewMinX);
+    final viewHeight = math.max(1.0, viewMaxY - viewMinY);
+    final scale = math.min(size.width / viewWidth, size.height / viewHeight);
+    final drawWidth = viewWidth * scale;
+    final drawHeight = viewHeight * scale;
+    final originX = (size.width - drawWidth) / 2;
+    final originY = (size.height - drawHeight) / 2;
 
     // Y da máquina cresce para o fundo da mesa; a tela cresce para baixo.
-    Offset toCanvas(Offset point) =>
-        Offset(point.dx * scale, size.height - point.dy * scale);
-
-    canvas.drawRect(
-      Offset.zero & size,
-      Paint()..color = NeoCncColors.canvas,
+    Offset toCanvas(Offset point) => Offset(
+      originX + (point.dx - viewMinX) * scale,
+      originY + drawHeight - (point.dy - viewMinY) * scale,
     );
 
-    final grid = Paint()
-      ..color = NeoCncColors.line.withValues(alpha: .5)
-      ..strokeWidth = 1;
-    for (var mm = 0.0; mm <= limits.maxX; mm += 20) {
-      canvas.drawLine(
-        toCanvas(Offset(mm, 0)),
-        toCanvas(Offset(mm, limits.maxY)),
-        grid,
-      );
-      canvas.drawLine(
-        toCanvas(Offset(0, mm)),
-        toCanvas(Offset(limits.maxX, mm)),
-        grid,
-      );
-    }
+    _paintGrid(canvas, size, viewMinX, viewMinY, viewMaxX, viewMaxY, toCanvas);
 
-    void drawPaths(List<List<Offset>> paths, Paint paint) {
-      for (final path in paths) {
-        if (path.length < 2) {
-          continue;
-        }
-        final drawn = Path()..moveTo(
-          toCanvas(path.first).dx,
-          toCanvas(path.first).dy,
-        );
-        for (final point in path.skip(1)) {
-          final mapped = toCanvas(point);
-          drawn.lineTo(mapped.dx, mapped.dy);
-        }
-        canvas.drawPath(drawn, paint);
-      }
-    }
-
-    drawPaths(
-      job.travelPaths,
+    // Contorno da mesa: mostra onde acaba o curso mesmo com zoom.
+    canvas.drawRect(
+      Rect.fromPoints(
+        toCanvas(Offset(0, limits.maxY)),
+        toCanvas(Offset(limits.maxX, 0)),
+      ),
       Paint()
-        ..color = NeoCncColors.muted.withValues(alpha: .35)
+        ..color = NeoCncColors.line
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+
+    _paintPaths(
+      canvas,
+      job.travelPaths,
+      toCanvas,
+      Paint()
+        ..color = NeoCncColors.muted.withValues(alpha: .5)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1,
+      dashed: true,
     );
-    drawPaths(
+    _paintPaths(
+      canvas,
       job.cutPaths,
+      toCanvas,
       Paint()
         ..color = NeoCncColors.cyan
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6
+        ..strokeWidth = fitToJob ? 2.2 : 1.6
+        ..strokeCap = StrokeCap.round
         ..strokeJoin = StrokeJoin.round,
     );
 
-    if (!job.bounds.isEmpty) {
-      final topLeft = toCanvas(Offset(job.bounds.minX, job.bounds.maxY));
-      final bottomRight = toCanvas(Offset(job.bounds.maxX, job.bounds.minY));
-      canvas.drawRect(
-        Rect.fromPoints(topLeft, bottomRight),
-        Paint()
-          ..color = NeoCncColors.amber.withValues(alpha: .7)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 1,
+    if (!bounds.isEmpty) {
+      _paintEnvelope(canvas, bounds, toCanvas);
+    }
+    _paintOrigin(canvas, toCanvas, viewMinX, viewMinY, viewMaxX, viewMaxY);
+    _paintScaleBar(canvas, size, scale);
+    if (fitToJob && !bounds.isEmpty) {
+      _paintMinimap(canvas, size, bounds);
+    }
+  }
+
+  void _paintGrid(
+    Canvas canvas,
+    Size size,
+    double viewMinX,
+    double viewMinY,
+    double viewMaxX,
+    double viewMaxY,
+    Offset Function(Offset) toCanvas,
+  ) {
+    final step = _niceStep(math.max(viewMaxX - viewMinX, viewMaxY - viewMinY) / 8);
+    final grid = Paint()
+      ..color = NeoCncColors.line.withValues(alpha: .5)
+      ..strokeWidth = 1;
+    for (var mm = (viewMinX / step).ceil() * step; mm <= viewMaxX; mm += step) {
+      canvas.drawLine(
+        toCanvas(Offset(mm, viewMinY)),
+        toCanvas(Offset(mm, viewMaxY)),
+        grid,
+      );
+      _label(
+        canvas,
+        _number(mm),
+        toCanvas(Offset(mm, viewMinY)).translate(2, -12),
+      );
+    }
+    for (var mm = (viewMinY / step).ceil() * step; mm <= viewMaxY; mm += step) {
+      canvas.drawLine(
+        toCanvas(Offset(viewMinX, mm)),
+        toCanvas(Offset(viewMaxX, mm)),
+        grid,
+      );
+      _label(
+        canvas,
+        _number(mm),
+        toCanvas(Offset(viewMinX, mm)).translate(3, 2),
       );
     }
   }
 
+  void _paintPaths(
+    Canvas canvas,
+    List<List<Offset>> paths,
+    Offset Function(Offset) toCanvas,
+    Paint paint, {
+    bool dashed = false,
+  }) {
+    for (final path in paths) {
+      if (path.length < 2) {
+        continue;
+      }
+      if (dashed) {
+        for (var i = 0; i + 1 < path.length; i++) {
+          _dashedLine(canvas, toCanvas(path[i]), toCanvas(path[i + 1]), paint);
+        }
+        continue;
+      }
+      final drawn = Path();
+      final first = toCanvas(path.first);
+      drawn.moveTo(first.dx, first.dy);
+      for (final point in path.skip(1)) {
+        final mapped = toCanvas(point);
+        drawn.lineTo(mapped.dx, mapped.dy);
+      }
+      canvas.drawPath(drawn, paint);
+    }
+  }
+
+  void _paintEnvelope(
+    Canvas canvas,
+    GcodeBounds bounds,
+    Offset Function(Offset) toCanvas,
+  ) {
+    final rect = Rect.fromPoints(
+      toCanvas(Offset(bounds.minX, bounds.maxY)),
+      toCanvas(Offset(bounds.maxX, bounds.minY)),
+    );
+    final paint = Paint()
+      ..color = NeoCncColors.amber.withValues(alpha: .75)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    _dashedLine(canvas, rect.topLeft, rect.topRight, paint);
+    _dashedLine(canvas, rect.topRight, rect.bottomRight, paint);
+    _dashedLine(canvas, rect.bottomRight, rect.bottomLeft, paint);
+    _dashedLine(canvas, rect.bottomLeft, rect.topLeft, paint);
+
+    _label(
+      canvas,
+      '${bounds.width.toStringAsFixed(1)} × '
+      '${bounds.height.toStringAsFixed(1)} mm',
+      rect.topLeft.translate(0, -14),
+      color: NeoCncColors.amber,
+    );
+    _label(
+      canvas,
+      'X${_number(bounds.minX)} Y${_number(bounds.minY)}',
+      rect.bottomLeft.translate(0, 3),
+      color: NeoCncColors.amber.withValues(alpha: .7),
+    );
+  }
+
+  void _paintOrigin(
+    Canvas canvas,
+    Offset Function(Offset) toCanvas,
+    double viewMinX,
+    double viewMinY,
+    double viewMaxX,
+    double viewMaxY,
+  ) {
+    if (viewMinX > 0 || viewMinY > 0 || viewMaxX < 0 || viewMaxY < 0) {
+      return;
+    }
+    final origin = toCanvas(Offset.zero);
+    final paint = Paint()
+      ..color = NeoCncColors.ink.withValues(alpha: .6)
+      ..strokeWidth = 1.2;
+    canvas.drawLine(origin.translate(-7, 0), origin.translate(7, 0), paint);
+    canvas.drawLine(origin.translate(0, -7), origin.translate(0, 7), paint);
+    _label(canvas, 'X0 Y0', origin.translate(8, 2));
+  }
+
+  /// Régua: sem ela não dá para saber o tamanho do que está na tela quando o
+  /// enquadramento muda.
+  void _paintScaleBar(Canvas canvas, Size size, double scale) {
+    final target = size.width / 4 / scale;
+    final millimeters = _niceStep(target);
+    final pixels = millimeters * scale;
+    final y = size.height - 12;
+    final left = 12.0;
+    final paint = Paint()
+      ..color = NeoCncColors.ink.withValues(alpha: .75)
+      ..strokeWidth = 1.5;
+    canvas.drawLine(Offset(left, y), Offset(left + pixels, y), paint);
+    canvas.drawLine(Offset(left, y - 4), Offset(left, y + 4), paint);
+    canvas.drawLine(
+      Offset(left + pixels, y - 4),
+      Offset(left + pixels, y + 4),
+      paint,
+    );
+    _label(
+      canvas,
+      '${_number(millimeters)} mm',
+      Offset(left, y - 20),
+      color: NeoCncColors.ink.withValues(alpha: .75),
+    );
+  }
+
+  /// Com zoom no trabalho perde-se a noção de onde ele fica na mesa; o
+  /// minimapa devolve isso.
+  void _paintMinimap(Canvas canvas, Size size, GcodeBounds bounds) {
+    const side = 62.0;
+    final rect = Rect.fromLTWH(size.width - side - 10, 10, side, side);
+    canvas.drawRect(
+      rect,
+      Paint()..color = NeoCncColors.surface.withValues(alpha: .9),
+    );
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = NeoCncColors.line
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+    final scale = math.min(side / limits.maxX, side / limits.maxY);
+    Offset toMini(Offset point) => Offset(
+      rect.left + point.dx * scale,
+      rect.bottom - point.dy * scale,
+    );
+    final job = Rect.fromPoints(
+      toMini(Offset(bounds.minX, bounds.maxY)),
+      toMini(Offset(bounds.maxX, bounds.minY)),
+    );
+    canvas.drawRect(
+      // Um trabalho pequeno vira um ponto: garante que dê para ver.
+      Rect.fromCenter(
+        center: job.center,
+        width: math.max(3, job.width),
+        height: math.max(3, job.height),
+      ),
+      Paint()..color = NeoCncColors.amber,
+    );
+  }
+
+  void _dashedLine(Canvas canvas, Offset from, Offset to, Paint paint) {
+    const dash = 4.0;
+    const gap = 3.0;
+    final total = (to - from).distance;
+    if (total <= 0) {
+      return;
+    }
+    final step = (to - from) / total;
+    var walked = 0.0;
+    while (walked < total) {
+      final end = math.min(walked + dash, total);
+      canvas.drawLine(from + step * walked, from + step * end, paint);
+      walked = end + gap;
+    }
+  }
+
+  void _label(Canvas canvas, String text, Offset at, {Color? color}) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: color ?? NeoCncColors.muted.withValues(alpha: .8),
+          fontSize: 9,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    painter.paint(canvas, at);
+  }
+
+  static double _niceStep(double target) {
+    for (final step in _niceSteps) {
+      if (step >= target) {
+        return step;
+      }
+    }
+    return _niceSteps.last;
+  }
+
+  static String _number(double value) {
+    if (value == value.roundToDouble()) {
+      return value.toInt().toString();
+    }
+    return value.toStringAsFixed(1);
+  }
+
   @override
   bool shouldRepaint(_JobPreviewPainter oldDelegate) =>
-      oldDelegate.job != job || oldDelegate.limits != limits;
+      oldDelegate.job != job ||
+      oldDelegate.limits != limits ||
+      oldDelegate.fitToJob != fitToJob;
 }
+
+
 
 String _formatDuration(Duration duration) {
   if (duration.inMinutes < 1) {
