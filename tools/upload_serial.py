@@ -17,8 +17,8 @@ sys.path.insert(0, str(ROOT / "firmware/marlin/buildroot/share/scripts"))
 import MarlinBinaryProtocol as mbp
 
 
-def ascii_command(port: str, command: str, timeout: float = 5) -> list[str]:
-    with serial.Serial(port, 115200, timeout=0.2, write_timeout=2, dsrdtr=False, rtscts=False, exclusive=True) as link:
+def ascii_command(port: str, command: str, baud: int, timeout: float = 5) -> list[str]:
+    with serial.Serial(port, baud, timeout=0.2, write_timeout=2, dsrdtr=False, rtscts=False, exclusive=True) as link:
         link.dtr = False
         link.rts = False
         time.sleep(0.2)
@@ -49,31 +49,35 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("firmware", type=Path)
     parser.add_argument("--port", default="/dev/ttyUSB0")
+    # NeoCNC 0.0.4 raised BAUDRATE to 250000. Uploading 0.0.4 over an older
+    # build still has to talk to the *installed* firmware, so pass --baud 115200
+    # for that one transfer.
+    parser.add_argument("--baud", type=int, default=250000, choices=[115200, 250000, 500000])
     args = parser.parse_args()
     firmware = args.firmware.resolve()
     if not firmware.is_file() or firmware.suffix.lower() != ".bin":
         raise SystemExit("firmware must be an existing .bin file")
 
-    m115 = ascii_command(args.port, "M115")
+    m115 = ascii_command(args.port, "M115", args.baud)
     if not any("Cap:BINARY_FILE_TRANSFER:1" in line for line in m115):
         raise RuntimeError("Installed firmware does not support BINARY_FILE_TRANSFER")
 
-    m21 = ascii_command(args.port, "M21")
+    m21 = ascii_command(args.port, "M21", args.baud)
     if not any("SD card ok" in line for line in m21):
         raise RuntimeError(f"M21 failed: {' | '.join(m21)}")
-    listed = ascii_command(args.port, "M20 F")
+    listed = ascii_command(args.port, "M20 F", args.baud)
     old_bins = [
         line.split()[0] for line in listed
         if line.split() and line.split()[0].upper().endswith(".BIN")
     ]
     for old_bin in old_bins:
-        deleted = ascii_command(args.port, f"M30 /{old_bin}")
-        remaining = ascii_command(args.port, "M20 F")
+        deleted = ascii_command(args.port, f"M30 /{old_bin}", args.baud)
+        remaining = ascii_command(args.port, "M20 F", args.baud)
         if any(line.split() and line.split()[0].upper() == old_bin.upper() for line in remaining):
             raise RuntimeError(f"M30 /{old_bin} failed: {' | '.join(deleted)}")
 
     target = "FW" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6)) + ".BIN"
-    protocol = mbp.Protocol(args.port, 115200, 512, 0, 1000)
+    protocol = mbp.Protocol(args.port, args.baud, 512, 0, 1000)
     binary_mode = False
     try:
         protocol.connect()

@@ -15,6 +15,12 @@ class UsbSerialTransport implements PrinterTransport {
   SerialPortReader? _reader;
   StreamSubscription<Uint8List>? _readerSubscription;
   String? _activePort;
+  int? _activeBaudRate;
+
+  /// A combinação Ender-3 V4.2.2 GD32 + CH340 é estável em 115200 baud.
+  /// Taxas maiores continuam disponíveis para equipamentos que as suportem.
+  static const int defaultBaudRate = 115200;
+  static const List<int> supportedBaudRates = [115200, 250000, 500000];
 
   @override
   Stream<String> get lines => _lineController.stream;
@@ -26,6 +32,9 @@ class UsbSerialTransport implements PrinterTransport {
   String? get activePort => _activePort;
 
   @override
+  int? get activeBaudRate => _activeBaudRate;
+
+  @override
   Future<List<String>> listPorts() async {
     final ports = SerialPort.getAvailablePorts();
     ports.sort();
@@ -33,15 +42,25 @@ class UsbSerialTransport implements PrinterTransport {
   }
 
   @override
-  Future<void> connect(String portName) async {
+  Future<void> connect(
+    String portName, {
+    int baudRate = defaultBaudRate,
+  }) async {
+    if (!supportedBaudRates.contains(baudRate)) {
+      throw ArgumentError.value(
+        baudRate,
+        'baudRate',
+        'Velocidade não suportada.',
+      );
+    }
     await disconnect();
 
     final port = SerialPort(portName);
     try {
       port.open();
       port.setConfig(
-        const SerialPortConfig(
-          baudRate: 115200,
+        SerialPortConfig(
+          baudRate: baudRate,
           bits: 8,
           parity: SerialPortParity.none,
           stopBits: 1,
@@ -59,6 +78,7 @@ class UsbSerialTransport implements PrinterTransport {
       _port = port;
       _reader = reader;
       _activePort = portName;
+      _activeBaudRate = baudRate;
     } catch (_) {
       if (port.isOpen()) {
         port.close();
@@ -91,10 +111,27 @@ class UsbSerialTransport implements PrinterTransport {
       throw StateError('Impressora não está conectada.');
     }
 
-    final payload = Uint8List.fromList(utf8.encode('${command.trim()}\n'));
-    final written = port.write(payload, timeout: 1500);
-    if (written != payload.length) {
-      throw StateError('A porta serial aceitou apenas $written bytes.');
+    await writeBytes(Uint8List.fromList(utf8.encode('${command.trim()}\n')));
+  }
+
+  @override
+  Future<void> writeBytes(Uint8List payload) async {
+    final port = _port;
+    if (port == null || !port.isOpen()) {
+      throw StateError('Impressora não está conectada.');
+    }
+
+    var offset = 0;
+    while (offset < payload.length) {
+      final chunk = Uint8List.sublistView(payload, offset);
+      final written = port.write(chunk, timeout: 3000);
+      if (written <= 0) {
+        throw StateError(
+          'A porta serial parou de aceitar dados após $offset de '
+          '${payload.length} bytes.',
+        );
+      }
+      offset += written;
     }
   }
 
@@ -108,6 +145,7 @@ class UsbSerialTransport implements PrinterTransport {
     _readerSubscription = null;
     _port = null;
     _activePort = null;
+    _activeBaudRate = null;
     _receivedBuffer.clear();
 
     if (reader != null) {

@@ -7,11 +7,17 @@ import 'package:flutter/material.dart';
 
 import '../../../core/theme/neocnc_theme.dart';
 import '../../drawing/application/plot_importer.dart';
+import '../../drawing/application/route_optimizer.dart';
+import '../../drawing/application/route_preview.dart';
+import '../../job/application/gcode_importer.dart';
+import '../../job/domain/gcode_job.dart';
+import '../../job/presentation/job_panel.dart';
 import '../../printer/application/printer_controller.dart';
+import '../../printer/data/usb_serial_transport.dart';
 import '../../printer/domain/drawing_point.dart';
 import '../../printer/domain/printer_snapshot.dart';
 
-enum _ControlTab { map, drawing, relativeMotion, logs }
+enum _ControlTab { map, drawing, job, relativeMotion, logs }
 
 String _completionSoundLabel(CompletionSound sound) => switch (sound) {
   CompletionSound.none => 'SEM SOM',
@@ -26,12 +32,18 @@ class CncDashboard extends StatefulWidget {
   State<CncDashboard> createState() => _CncDashboardState();
 }
 
-class _CncDashboardState extends State<CncDashboard> {
+class _CncDashboardState extends State<CncDashboard>
+    with SingleTickerProviderStateMixin {
   static const _initialImportLongestSideMm = 100.0;
+  static const _previewMinDuration = Duration(seconds: 3);
+  static const _previewMaxDuration = Duration(seconds: 20);
 
   late final PrinterController _controller;
+  late final AnimationController _previewController;
+  bool _showRoutePreview = false;
   final TextEditingController _commandController = TextEditingController();
   String? _selectedPort;
+  int _baudRate = UsbSerialTransport.defaultBaudRate;
   double _step = 1;
   double _feedrate = 40;
   bool _mapArmed = false;
@@ -45,28 +57,141 @@ class _CncDashboardState extends State<CncDashboard> {
   bool _importingDrawing = false;
   String? _importedDrawingLabel;
   List<List<Offset>>? _importedBaseStrokes;
+  String? _importedSvgSource;
+  String? _importedSvgFileName;
   double? _routeWidthMm;
   double? _routeHeightMm;
   double _routeRotationDegrees = 0;
   double _routeCenterX = 110;
   double _routeCenterY = 110;
   bool _lockRouteProportions = true;
+  MachineLimits _machineLimits = MachineLimits.neoCnc;
   _ControlTab _selectedTab = _ControlTab.map;
   String _printerModel = 'Ender-3 Neo / NeoCNC';
   bool _compactControls = false;
+  String? _jobSource;
+  GcodeJob? _job;
+  double _jobZOffsetMm = 0;
+  bool _importingJob = false;
+  String? _jobRemoteName;
+  String? _jobUploadedName;
 
   @override
   void initState() {
     super.initState();
     _controller = PrinterController();
+    _previewController = AnimationController(vsync: this)
+      ..addListener(() => setState(() {}));
     unawaited(_refreshPorts());
   }
 
   @override
   void dispose() {
+    _previewController.dispose();
     _commandController.dispose();
     _controller.dispose();
     super.dispose();
+  }
+
+  /// Percurso que a máquina vai fazer na rota atual, incluindo os
+  /// deslocamentos com a caneta levantada.
+  RoutePreview get _routePreview => RoutePreview.fromStrokes(
+    _drawingStrokes,
+    origin: _controller.isFullyReferenced
+        ? Offset(_controller.snapshot.x, _controller.snapshot.y)
+        : null,
+  );
+
+  /// Toda rota importada entra já com a ordem dos traços otimizada: o arquivo
+  /// guarda as formas na ordem em que foram criadas, que costuma fazer a
+  /// caneta cruzar a mesa à toa entre um traço e outro.
+  List<List<Offset>> _asBaseStrokes(List<List<Offset>> strokes) {
+    return List<List<Offset>>.unmodifiable(
+      RouteOptimizer.optimize(strokes)
+          .map((stroke) => List<Offset>.unmodifiable(stroke))
+          .toList(growable: false),
+    );
+  }
+
+  /// Reordena a rota que já está na mesa (útil depois de desenhar à mão, ou
+  /// para reotimizar depois de mover/girar a rota importada).
+  void _optimizeCurrentRoute() {
+    if (_controller.isDrawing || _drawingStrokes.length < 2) {
+      return;
+    }
+    final origin = _controller.isFullyReferenced
+        ? Offset(_controller.snapshot.x, _controller.snapshot.y)
+        : null;
+    final before = RouteOptimizer.travelLength(_drawingStrokes, origin: origin);
+
+    final base = _importedBaseStrokes;
+    if (base != null) {
+      // Reordena a base para que redimensionar e girar continuem valendo.
+      setState(() {
+        _importedBaseStrokes = _asBaseStrokes(base);
+        _previewController.value = 0;
+      });
+      _transformImportedRoute();
+    } else {
+      setState(() {
+        _drawingStrokes
+          ..clear()
+          ..addAll(RouteOptimizer.optimize(_drawingStrokes, origin: origin));
+        _previewController.value = 0;
+      });
+    }
+
+    final after = RouteOptimizer.travelLength(_drawingStrokes, origin: origin);
+    _showMessage(
+      after < before
+          ? 'Deslocamento: ${before.round()} mm → ${after.round()} mm.'
+          : 'A rota já estava na melhor ordem encontrada '
+                '(${after.round()} mm de deslocamento).',
+    );
+  }
+
+  void _setRoutePreviewVisible(bool visible) {
+    setState(() {
+      _showRoutePreview = visible;
+      _previewController.value = 0;
+    });
+    if (!visible) {
+      _previewController.stop();
+    }
+  }
+
+  void _toggleRoutePreviewPlayback() {
+    if (_previewController.isAnimating) {
+      _previewController.stop();
+      setState(() {});
+      return;
+    }
+    final preview = _routePreview;
+    if (preview.isEmpty) {
+      return;
+    }
+    // A prévia roda numa escala de tempo confortável de assistir, não em
+    // tempo real: um desenho de 40 minutos não pode levar 40 minutos aqui.
+    final real = preview.estimate(
+      feedrateMmPerSecond: _feedrate,
+      penLiftMm: _penLiftMm,
+    );
+    final scaled = Duration(milliseconds: real.inMilliseconds ~/ 12);
+    _previewController.duration = Duration(
+      milliseconds: scaled.inMilliseconds.clamp(
+        _previewMinDuration.inMilliseconds,
+        _previewMaxDuration.inMilliseconds,
+      ),
+    );
+    if (_previewController.value >= 1) {
+      _previewController.value = 0;
+    }
+    unawaited(_previewController.forward());
+  }
+
+  void _seekRoutePreview(double value) {
+    _previewController.stop();
+    setState(() => _previewController.value = value.clamp(0.0, 1.0));
   }
 
   Future<void> _refreshPorts() async {
@@ -104,7 +229,7 @@ class _CncDashboardState extends State<CncDashboard> {
       _showMessage('Selecione uma porta, por exemplo /dev/ttyUSB0.');
       return;
     }
-    await _perform(() => _controller.connect(port));
+    await _perform(() => _controller.connect(port, baudRate: _baudRate));
   }
 
   Future<void> _perform(Future<void> Function() action) async {
@@ -192,11 +317,13 @@ class _CncDashboardState extends State<CncDashboard> {
     }
     setState(() {
       _importedBaseStrokes = null;
+      _importedSvgSource = null;
+      _importedSvgFileName = null;
       _routeWidthMm = null;
       _routeHeightMm = null;
       _routeRotationDegrees = 0;
-      _routeCenterX = 110;
-      _routeCenterY = 110;
+      _routeCenterX = _machineLimits.maxX / 2;
+      _routeCenterY = _machineLimits.maxY / 2;
       _importedDrawingLabel = null;
       _drawingStrokes.add([point]);
     });
@@ -227,12 +354,53 @@ class _CncDashboardState extends State<CncDashboard> {
       _drawingStrokes.clear();
       _importedDrawingLabel = null;
       _importedBaseStrokes = null;
+      _importedSvgSource = null;
+      _importedSvgFileName = null;
       _routeWidthMm = null;
       _routeHeightMm = null;
       _routeRotationDegrees = 0;
-      _routeCenterX = 110;
-      _routeCenterY = 110;
+      _routeCenterX = _machineLimits.maxX / 2;
+      _routeCenterY = _machineLimits.maxY / 2;
     });
+  }
+
+  Future<void> _setSvgTraceMode(SvgTraceMode mode) async {
+    final source = _importedSvgSource;
+    setState(() {
+      _svgTraceMode = mode;
+      if (source != null) {
+        _importingDrawing = true;
+      }
+    });
+    if (source == null) {
+      return;
+    }
+    // Deixa o quadro com "CONVERTENDO ROTA…" ser pintado antes de segurar a
+    // thread: em SVG com centenas de formas o esqueleto leva alguns segundos.
+    await Future<void>.delayed(Duration.zero);
+    try {
+      final result = PlotImporter.fromSvg(
+        source,
+        label: _importedSvgFileName ?? 'SVG',
+        mode: mode,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _importedBaseStrokes = _asBaseStrokes(result.strokes);
+        _importedDrawingLabel = result.label;
+      });
+      _transformImportedRoute();
+    } catch (error) {
+      if (mounted) {
+        _showMessage('Falha ao trocar o modo do traço: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _importingDrawing = false);
+      }
+    }
   }
 
   void _transformImportedRoute({
@@ -250,10 +418,15 @@ class _CncDashboardState extends State<CncDashboard> {
     }
 
     final original = PlotImporter.measure(baseStrokes);
-    var targetWidth = (width ?? currentWidth).clamp(5.0, 220.0).toDouble();
-    var targetHeight = (height ?? currentHeight).clamp(5.0, 220.0).toDouble();
-    final targetRotation =
-        (rotationDegrees ?? _routeRotationDegrees).clamp(0.0, 360.0).toDouble();
+    var targetWidth = (width ?? currentWidth)
+        .clamp(5.0, _machineLimits.maxX)
+        .toDouble();
+    var targetHeight = (height ?? currentHeight)
+        .clamp(5.0, _machineLimits.maxY)
+        .toDouble();
+    final targetRotation = (rotationDegrees ?? _routeRotationDegrees)
+        .clamp(0.0, 360.0)
+        .toDouble();
     if (_lockRouteProportions) {
       if (width != null) {
         targetHeight = targetWidth * original.height / original.width;
@@ -263,7 +436,10 @@ class _CncDashboardState extends State<CncDashboard> {
     }
     final fit = math.min(
       1.0,
-      math.min(220.0 / targetWidth, 220.0 / targetHeight),
+      math.min(
+        _machineLimits.maxX / targetWidth,
+        _machineLimits.maxY / targetHeight,
+      ),
     );
     targetWidth *= fit;
     targetHeight *= fit;
@@ -273,22 +449,30 @@ class _CncDashboardState extends State<CncDashboard> {
       width: targetWidth,
       height: targetHeight,
       rotationDegrees: targetRotation,
+      maxX: _machineLimits.maxX,
+      maxY: _machineLimits.maxY,
     );
     final footprint = PlotImporter.measure(centered);
-    final halfWidth = (footprint.width / 2).clamp(0.0, 110.0).toDouble();
-    final halfHeight = (footprint.height / 2).clamp(0.0, 110.0).toDouble();
-    final targetCenterX =
-        (centerX ?? _routeCenterX).clamp(halfWidth, 220.0 - halfWidth).toDouble();
-    final targetCenterY =
-        (centerY ?? _routeCenterY)
-            .clamp(halfHeight, 220.0 - halfHeight)
-            .toDouble();
+    final halfWidth = (footprint.width / 2)
+        .clamp(0.0, _machineLimits.maxX / 2)
+        .toDouble();
+    final halfHeight = (footprint.height / 2)
+        .clamp(0.0, _machineLimits.maxY / 2)
+        .toDouble();
+    final targetCenterX = (centerX ?? _routeCenterX)
+        .clamp(halfWidth, _machineLimits.maxX - halfWidth)
+        .toDouble();
+    final targetCenterY = (centerY ?? _routeCenterY)
+        .clamp(halfHeight, _machineLimits.maxY - halfHeight)
+        .toDouble();
     final transformed = PlotImporter.resizeRotateAndCenter(
       baseStrokes,
       width: targetWidth,
       height: targetHeight,
       rotationDegrees: targetRotation,
       center: Offset(targetCenterX, targetCenterY),
+      maxX: _machineLimits.maxX,
+      maxY: _machineLimits.maxY,
     );
     setState(() {
       _drawingStrokes
@@ -308,7 +492,10 @@ class _CncDashboardState extends State<CncDashboard> {
       return;
     }
     final dimensions = PlotImporter.measure(baseStrokes);
-    final scale = 220.0 / math.max(dimensions.width, dimensions.height);
+    final scale = math.min(
+      _machineLimits.maxX / dimensions.width,
+      _machineLimits.maxY / dimensions.height,
+    );
     _transformImportedRoute(
       width: dimensions.width * scale,
       height: dimensions.height * scale,
@@ -363,11 +550,7 @@ class _CncDashboardState extends State<CncDashboard> {
         }
       }
       setState(() {
-        final baseStrokes = List<List<Offset>>.unmodifiable(
-          result.strokes
-              .map((stroke) => List<Offset>.unmodifiable(stroke))
-              .toList(growable: false),
-        );
+        final baseStrokes = _asBaseStrokes(result.strokes);
         final dimensions = PlotImporter.measure(baseStrokes);
         final initialScale =
             _initialImportLongestSideMm /
@@ -379,17 +562,21 @@ class _CncDashboardState extends State<CncDashboard> {
           width: initialWidth,
           height: initialHeight,
           rotationDegrees: 0,
+          maxX: _machineLimits.maxX,
+          maxY: _machineLimits.maxY,
         );
         _drawingStrokes
           ..clear()
           ..addAll(initialRoute);
         _importedDrawingLabel = result.label;
         _importedBaseStrokes = baseStrokes;
+        _importedSvgSource = svg ? utf8.decode(bytes) : null;
+        _importedSvgFileName = svg ? file.name : null;
         _routeWidthMm = initialWidth;
         _routeHeightMm = initialHeight;
         _routeRotationDegrees = 0;
-        _routeCenterX = 110;
-        _routeCenterY = 110;
+        _routeCenterX = _machineLimits.maxX / 2;
+        _routeCenterY = _machineLimits.maxY / 2;
       });
       _showMessage(
         '${result.label} importado: ${result.segmentCount} segmentos.',
@@ -421,6 +608,22 @@ class _CncDashboardState extends State<CncDashboard> {
       _showMessage('Desenhe ao menos um traço antes de enviar.');
       return;
     }
+    final isOutsideProfile = _drawingStrokes
+        .expand((stroke) => stroke)
+        .any(
+          (point) =>
+              point.dx < 0 ||
+              point.dy < 0 ||
+              point.dx > _machineLimits.maxX ||
+              point.dy > _machineLimits.maxY,
+        );
+    if (isOutsideProfile) {
+      _showMessage(
+        'O desenho excede o perfil ${_machineLimits.label}. Ajuste a rota '
+        'antes de enviar.',
+      );
+      return;
+    }
     final proceed = await _confirm(
       title: 'Enviar desenho para a máquina?',
       body:
@@ -450,6 +653,144 @@ class _CncDashboardState extends State<CncDashboard> {
         completionSound: _completionSound,
       ),
     );
+  }
+
+  Future<void> _importJob() async {
+    if (_importingJob || _controller.isBusy) {
+      return;
+    }
+    final file = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'G-code de CAM',
+          extensions: ['nc', 'gcode', 'gco', 'ngc', 'tap', 'cnc'],
+        ),
+      ],
+      confirmButtonText: 'IMPORTAR TRABALHO',
+    );
+    if (file == null || !mounted) {
+      return;
+    }
+    setState(() => _importingJob = true);
+    try {
+      final source = utf8.decode(
+        await file.readAsBytes(),
+        allowMalformed: true,
+      );
+      final job = GcodeImporter.parse(
+        source,
+        name: file.name,
+        zOffsetMm: _jobZOffsetMm,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _jobSource = source;
+        _job = job;
+        _jobRemoteName = GcodeJob.toShortFilename(file.name);
+        _jobUploadedName = null;
+      });
+      _showMessage(
+        '${job.commandCount} comandos, '
+        '${job.cutLengthMm.toStringAsFixed(0)} mm de corte.',
+      );
+    } catch (error) {
+      if (mounted) {
+        _showMessage('Não foi possível ler o arquivo: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _importingJob = false);
+      }
+    }
+  }
+
+  void _setJobZOffset(double value) {
+    final source = _jobSource;
+    final job = _job;
+    if (source == null || job == null) {
+      return;
+    }
+    setState(() {
+      _jobZOffsetMm = value;
+      _job = GcodeImporter.parse(source, name: job.name, zOffsetMm: value);
+      // O arquivo já gravado no cartão passa a não corresponder ao preview.
+      _jobUploadedName = null;
+    });
+  }
+
+  Future<void> _uploadJob() async {
+    final job = _job;
+    final remoteName = _jobRemoteName;
+    if (job == null || remoteName == null) {
+      return;
+    }
+    final violations = job.violationsFor(_machineLimits);
+    if (violations.isNotEmpty) {
+      _showMessage(violations.first);
+      return;
+    }
+    final gcode = GcodeImporter.render(job.commands, name: job.name);
+    await _perform(() async {
+      await _controller.uploadJob(gcode: gcode, remoteName: remoteName);
+      if (mounted) {
+        setState(() => _jobUploadedName = remoteName);
+      }
+    });
+  }
+
+  Future<void> _startJob() async {
+    final remoteName = _jobUploadedName;
+    final job = _job;
+    if (remoteName == null || job == null) {
+      return;
+    }
+    final confirmed = await _confirm(
+      title: 'Iniciar o corte?',
+      body:
+          'A máquina vai executar $remoteName direto do cartão, sem depender '
+          'do computador.\n\nConfira antes: placa fixada, fresa firme, zero '
+          'de Z na superfície do cobre e o caminho livre até '
+          'X${job.bounds.maxX.toStringAsFixed(0)} '
+          'Y${job.bounds.maxY.toStringAsFixed(0)}.',
+      accept: 'INICIAR',
+    );
+    if (!confirmed) {
+      return;
+    }
+    await _perform(() => _controller.startSdJob(remoteName));
+  }
+
+  Future<void> _abortJob() async {
+    final confirmed = await _confirm(
+      title: 'Abortar o corte?',
+      body:
+          'O trabalho para onde estiver e a ferramenta é desligada. A fresa '
+          'fica dentro do material: suba o Z antes de retirar a placa.',
+      accept: 'ABORTAR',
+      destructive: true,
+    );
+    if (!confirmed) {
+      return;
+    }
+    await _perform(_controller.abortSdJob);
+  }
+
+  Future<void> _spindleOn() async {
+    final confirmed = await _confirm(
+      title: 'Ligar a ferramenta?',
+      body:
+          'A microrretífica parte imediatamente e leva alguns segundos até a '
+          'rotação de trabalho. Afaste as mãos e confirme que a fresa está '
+          'presa na pinça.',
+      accept: 'LIGAR',
+      destructive: true,
+    );
+    if (!confirmed) {
+      return;
+    }
+    await _perform(_controller.spindleOn);
   }
 
   Future<void> _sendManual() async {
@@ -486,7 +827,7 @@ class _CncDashboardState extends State<CncDashboard> {
     if (_controller.isConnected) {
       await _perform(_controller.disconnect);
     }
-    await _perform(() => _controller.connect(port));
+    await _perform(() => _controller.connect(port, baudRate: _baudRate));
   }
 
   Future<void> _openDeviceSettings() async {
@@ -506,6 +847,8 @@ class _CncDashboardState extends State<CncDashboard> {
         ports: _controller.ports,
         initialModel: _printerModel,
         initialPort: _selectedPort,
+        initialBaudRate: _baudRate,
+        initialLimits: _machineLimits,
       ),
     );
     if (selection == null || !mounted) {
@@ -518,12 +861,27 @@ class _CncDashboardState extends State<CncDashboard> {
     setState(() {
       _printerModel = selection.model;
       _selectedPort = port;
+      _baudRate = selection.baudRate;
+      _machineLimits = selection.limits;
+      _mapTarget = _mapTarget == null
+          ? null
+          : Offset(
+              _mapTarget!.dx.clamp(0.0, selection.limits.maxX).toDouble(),
+              _mapTarget!.dy.clamp(0.0, selection.limits.maxY).toDouble(),
+            );
+      _routeCenterX = _routeCenterX
+          .clamp(0.0, selection.limits.maxX)
+          .toDouble();
+      _routeCenterY = _routeCenterY
+          .clamp(0.0, selection.limits.maxY)
+          .toDouble();
+      _jobUploadedName = null;
     });
     if (selection.connectNow && port != null) {
       if (_controller.isConnected) {
         await _perform(_controller.disconnect);
       }
-      await _perform(() => _controller.connect(port));
+      await _perform(() => _controller.connect(port, baudRate: _baudRate));
     }
   }
 
@@ -700,6 +1058,7 @@ class _CncDashboardState extends State<CncDashboard> {
         armed: _mapArmed,
         xyReferenced: _controller.isXyReferenced,
         target: _mapTarget,
+        limits: _machineLimits,
         onArmedChanged: (armed) {
           if (!_controller.isXyReferenced && armed) {
             _showMessage('Faça HOME XY antes de armar o mapa.');
@@ -712,6 +1071,7 @@ class _CncDashboardState extends State<CncDashboard> {
       _ControlTab.drawing => _DrawingPanel(
         snapshot: snapshot,
         strokes: _drawingStrokes,
+        limits: _machineLimits,
         penLiftMm: _penLiftMm,
         drawingZ: _drawingZ,
         feedrate: _feedrate,
@@ -723,6 +1083,14 @@ class _CncDashboardState extends State<CncDashboard> {
         importedLabel: _importedDrawingLabel,
         imageThreshold: _imageThreshold,
         svgTraceMode: _svgTraceMode,
+        routePreview: _routePreview,
+        showRoutePreview: _showRoutePreview,
+        previewProgress: _previewController.value,
+        previewPlaying: _previewController.isAnimating,
+        onShowRoutePreviewChanged: _setRoutePreviewVisible,
+        onTogglePreviewPlayback: _toggleRoutePreviewPlayback,
+        onSeekPreview: _seekRoutePreview,
+        onOptimizeRoute: _optimizeCurrentRoute,
         completionSound: _completionSound,
         routeWidthMm: _routeWidthMm,
         routeHeightMm: _routeHeightMm,
@@ -740,11 +1108,9 @@ class _CncDashboardState extends State<CncDashboard> {
         onClear: _clearDrawing,
         onImageThresholdChanged: (value) =>
             setState(() => _imageThreshold = value),
-        onSvgTraceModeChanged: (mode) =>
-            setState(() => _svgTraceMode = mode),
+        onSvgTraceModeChanged: _setSvgTraceMode,
         onRouteWidthChanged: (value) => _transformImportedRoute(width: value),
-        onRouteHeightChanged: (value) =>
-            _transformImportedRoute(height: value),
+        onRouteHeightChanged: (value) => _transformImportedRoute(height: value),
         onRouteRotationChanged: (value) =>
             _transformImportedRoute(rotationDegrees: value),
         onRouteCenterXChanged: (value) =>
@@ -761,6 +1127,32 @@ class _CncDashboardState extends State<CncDashboard> {
         onImportRaster: () => _importDrawing(svg: false),
         onImportSvg: () => _importDrawing(svg: true),
         onSend: _sendDrawing,
+      ),
+      _ControlTab.job => JobPanel(
+        job: _job,
+        limits: _machineLimits,
+        violations: _job?.violationsFor(_machineLimits) ?? const [],
+        remoteName: _jobRemoteName,
+        zOffsetMm: _jobZOffsetMm,
+        importing: _importingJob,
+        uploading: _controller.isUploading,
+        uploadProgress: _controller.uploadProgress,
+        uploadedName: _jobUploadedName,
+        connected: snapshot.isConnected,
+        fullyReferenced: _controller.isFullyReferenced,
+        sdJobName: _controller.sdJobName,
+        sdStatus: snapshot.sdStatus,
+        sdProgress: snapshot.sdProgress,
+        onImport: _importJob,
+        onZOffsetChanged: (value) => setState(() => _jobZOffsetMm = value),
+        onZOffsetCommitted: _setJobZOffset,
+        onUpload: _uploadJob,
+        onStart: _startJob,
+        onPause: () => _perform(_controller.pauseSdJob),
+        onResume: () => _perform(_controller.resumeSdJob),
+        onAbort: _abortJob,
+        onSpindleOn: _spindleOn,
+        onSpindleOff: () => _perform(_controller.spindleOff),
       ),
       _ControlTab.relativeMotion => _MotionPanel(
         enabled: snapshot.isConnected,
@@ -882,6 +1274,11 @@ class _ControlDrawer extends StatelessWidget {
                     icon: Icon(Icons.gesture_outlined),
                     selectedIcon: Icon(Icons.gesture_rounded),
                     label: Text('DESENHO XY'),
+                  ),
+                  NavigationDrawerDestination(
+                    icon: Icon(Icons.precision_manufacturing_outlined),
+                    selectedIcon: Icon(Icons.precision_manufacturing_rounded),
+                    label: Text('CORTE / CAM'),
                   ),
                   NavigationDrawerDestination(
                     icon: Icon(Icons.open_with_outlined),
@@ -1089,6 +1486,10 @@ class _PageTitle extends StatelessWidget {
         'DESENHO XY',
         'Trace no tapete; a máquina reproduz com a ferramenta em Z.',
       ),
+      _ControlTab.job => (
+        'TRABALHO DE CORTE',
+        'Importa G-code de CAM, grava no cartão e executa da própria máquina.',
+      ),
       _ControlTab.relativeMotion => (
         'MOVIMENTO RELATIVO',
         'Jog por passo configurável usando a velocidade global.',
@@ -1124,14 +1525,18 @@ class _DeviceSelection {
   const _DeviceSelection({
     required this.model,
     required this.port,
+    required this.baudRate,
     required this.autoPort,
     required this.connectNow,
+    required this.limits,
   });
 
   final String model;
   final String? port;
+  final int baudRate;
   final bool autoPort;
   final bool connectNow;
+  final MachineLimits limits;
 }
 
 class _DeviceSettingsDialog extends StatefulWidget {
@@ -1140,12 +1545,16 @@ class _DeviceSettingsDialog extends StatefulWidget {
     required this.ports,
     required this.initialModel,
     required this.initialPort,
+    required this.initialBaudRate,
+    required this.initialLimits,
   });
 
   final List<String> models;
   final List<String> ports;
   final String initialModel;
   final String? initialPort;
+  final int initialBaudRate;
+  final MachineLimits initialLimits;
 
   @override
   State<_DeviceSettingsDialog> createState() => _DeviceSettingsDialogState();
@@ -1154,6 +1563,8 @@ class _DeviceSettingsDialog extends StatefulWidget {
 class _DeviceSettingsDialogState extends State<_DeviceSettingsDialog> {
   late String _model = widget.initialModel;
   late String? _port = widget.initialPort;
+  late int _baudRate = widget.initialBaudRate;
+  late MachineLimits _limits = widget.initialLimits;
   bool _autoPort = true;
   bool _connectNow = false;
 
@@ -1203,6 +1614,51 @@ class _DeviceSettingsDialogState extends State<_DeviceSettingsDialog> {
                 onChanged: (port) => setState(() => _port = port),
               ),
             ],
+            const SizedBox(height: 12),
+            DropdownButtonFormField<int>(
+              initialValue: _baudRate,
+              decoration: const InputDecoration(
+                labelText: 'VELOCIDADE DA SERIAL',
+                helperText:
+                    'Ender-3 V4.2.2/GD32 usa 115200. Use taxas maiores apenas em máquinas validadas.',
+              ),
+              items: UsbSerialTransport.supportedBaudRates
+                  .map(
+                    (baud) => DropdownMenuItem(
+                      value: baud,
+                      child: Text('$baud baud'),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (baud) {
+                if (baud != null) {
+                  setState(() => _baudRate = baud);
+                }
+              },
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<MachineLimits>(
+              initialValue: _limits,
+              decoration: const InputDecoration(
+                labelText: 'ÁREA ÚTIL / LIMITE CAM',
+                helperText:
+                    'Selecione o mesmo perfil gravado no firmware da máquina.',
+              ),
+              items: MachineLimits.profiles
+                  .map(
+                    (limits) => DropdownMenuItem(
+                      value: limits,
+                      child: Text(limits.label),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (limits) {
+                if (limits != null) {
+                  setState(() => _limits = limits);
+                }
+              },
+            ),
+            const SizedBox(height: 4),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('CONECTAR APÓS SALVAR'),
@@ -1229,8 +1685,10 @@ class _DeviceSettingsDialogState extends State<_DeviceSettingsDialog> {
             _DeviceSelection(
               model: _model,
               port: _port,
+              baudRate: _baudRate,
               autoPort: _autoPort,
               connectNow: _connectNow,
+              limits: _limits,
             ),
           ),
           child: const Text('SALVAR'),
@@ -1312,16 +1770,16 @@ class _WorkMapPanel extends StatelessWidget {
     required this.armed,
     required this.xyReferenced,
     required this.target,
+    required this.limits,
     required this.onArmedChanged,
     required this.onTarget,
   });
-
-  static const _travel = 220.0;
 
   final PrinterSnapshot snapshot;
   final bool armed;
   final bool xyReferenced;
   final Offset? target;
+  final MachineLimits limits;
   final ValueChanged<bool> onArmedChanged;
   final Future<void> Function(Offset target) onTarget;
 
@@ -1345,7 +1803,8 @@ class _WorkMapPanel extends StatelessWidget {
             children: [
               Text(
                 xyReferenced
-                    ? 'ÁREA ÚTIL  X0–220 • Y0–220 mm'
+                    ? 'ÁREA ÚTIL  X0–${limits.maxX.round()} • '
+                          'Y0–${limits.maxY.round()} mm'
                     : 'REFERENCIE XY PARA LIBERAR O MAPA',
                 style: TextStyle(
                   color: xyReferenced ? NeoCncColors.cyan : NeoCncColors.muted,
@@ -1384,15 +1843,16 @@ class _WorkMapPanel extends StatelessWidget {
                       behavior: HitTestBehavior.opaque,
                       onTapDown: (details) {
                         final point = details.localPosition;
-                        final x = (point.dx / mapConstraints.maxWidth * _travel)
-                            .clamp(0.0, _travel)
-                            .toDouble();
+                        final x =
+                            (point.dx / mapConstraints.maxWidth * limits.maxX)
+                                .clamp(0.0, limits.maxX)
+                                .toDouble();
                         final y =
-                            (_travel -
+                            (limits.maxY -
                                     point.dy /
                                         mapConstraints.maxHeight *
-                                        _travel)
-                                .clamp(0.0, _travel)
+                                        limits.maxY)
+                                .clamp(0.0, limits.maxY)
                                 .toDouble();
                         unawaited(onTarget(Offset(x, y)));
                       },
@@ -1402,6 +1862,7 @@ class _WorkMapPanel extends StatelessWidget {
                               ? Offset(snapshot.x, snapshot.y)
                               : null,
                           target: target,
+                          limits: limits,
                         ),
                         child: const SizedBox.expand(),
                       ),
@@ -1446,12 +1907,15 @@ class _WorkMapPanel extends StatelessWidget {
 }
 
 class _WorkMapPainter extends CustomPainter {
-  const _WorkMapPainter({required this.current, required this.target});
-
-  static const _travel = 220.0;
+  const _WorkMapPainter({
+    required this.current,
+    required this.target,
+    required this.limits,
+  });
 
   final Offset? current;
   final Offset? target;
+  final MachineLimits limits;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1466,11 +1930,15 @@ class _WorkMapPainter extends CustomPainter {
       ..strokeWidth = 1;
 
     canvas.drawRect(area, background);
-    for (var mm = 20.0; mm < _travel; mm += 20) {
-      final x = mm / _travel * size.width;
-      final y = size.height - mm / _travel * size.height;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+    for (var mm = 20.0; mm < limits.maxX || mm < limits.maxY; mm += 20) {
+      if (mm < limits.maxX) {
+        final x = mm / limits.maxX * size.width;
+        canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
+      }
+      if (mm < limits.maxY) {
+        final y = size.height - mm / limits.maxY * size.height;
+        canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+      }
     }
     canvas.drawRect(area.deflate(.75), border);
 
@@ -1486,16 +1954,16 @@ class _WorkMapPainter extends CustomPainter {
 
   Offset _toCanvas(Offset point, Size size) {
     return Offset(
-      point.dx / _travel * size.width,
-      size.height - point.dy / _travel * size.height,
+      point.dx / limits.maxX * size.width,
+      size.height - point.dy / limits.maxY * size.height,
     );
   }
 
   bool _isWithin(Offset point) {
     return point.dx >= 0 &&
-        point.dx <= _travel &&
+        point.dx <= limits.maxX &&
         point.dy >= 0 &&
-        point.dy <= _travel;
+        point.dy <= limits.maxY;
   }
 
   void _drawCurrent(Canvas canvas, Offset point) {
@@ -1519,7 +1987,9 @@ class _WorkMapPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _WorkMapPainter oldDelegate) {
-    return oldDelegate.current != current || oldDelegate.target != target;
+    return oldDelegate.current != current ||
+        oldDelegate.target != target ||
+        oldDelegate.limits != limits;
   }
 }
 
@@ -1527,6 +1997,7 @@ class _DrawingPanel extends StatelessWidget {
   const _DrawingPanel({
     required this.snapshot,
     required this.strokes,
+    required this.limits,
     required this.penLiftMm,
     required this.drawingZ,
     required this.feedrate,
@@ -1538,6 +2009,14 @@ class _DrawingPanel extends StatelessWidget {
     required this.importedLabel,
     required this.imageThreshold,
     required this.svgTraceMode,
+    required this.routePreview,
+    required this.showRoutePreview,
+    required this.previewProgress,
+    required this.previewPlaying,
+    required this.onShowRoutePreviewChanged,
+    required this.onTogglePreviewPlayback,
+    required this.onSeekPreview,
+    required this.onOptimizeRoute,
     required this.completionSound,
     required this.routeWidthMm,
     required this.routeHeightMm,
@@ -1567,10 +2046,9 @@ class _DrawingPanel extends StatelessWidget {
     required this.onSend,
   });
 
-  static const _travel = 220.0;
-
   final PrinterSnapshot snapshot;
   final List<List<Offset>> strokes;
+  final MachineLimits limits;
   final double penLiftMm;
   final double drawingZ;
   final double feedrate;
@@ -1582,6 +2060,14 @@ class _DrawingPanel extends StatelessWidget {
   final String? importedLabel;
   final double imageThreshold;
   final SvgTraceMode svgTraceMode;
+  final RoutePreview routePreview;
+  final bool showRoutePreview;
+  final double previewProgress;
+  final bool previewPlaying;
+  final ValueChanged<bool> onShowRoutePreviewChanged;
+  final VoidCallback onTogglePreviewPlayback;
+  final ValueChanged<double> onSeekPreview;
+  final VoidCallback onOptimizeRoute;
   final CompletionSound completionSound;
   final double? routeWidthMm;
   final double? routeHeightMm;
@@ -1620,31 +2106,31 @@ class _DrawingPanel extends StatelessWidget {
 
   double get _routeMaxWidthMm {
     if (!_canResizeRoute || !lockRouteProportions) {
-      return 220;
+      return limits.maxX;
     }
-    return math.min(220.0, 220.0 * routeWidthMm! / routeHeightMm!);
+    return math.min(limits.maxX, limits.maxY * routeWidthMm! / routeHeightMm!);
   }
 
   double get _routeMaxHeightMm {
     if (!_canResizeRoute || !lockRouteProportions) {
-      return 220;
+      return limits.maxY;
     }
-    return math.min(220.0, 220.0 * routeHeightMm! / routeWidthMm!);
+    return math.min(limits.maxY, limits.maxX * routeHeightMm! / routeWidthMm!);
   }
 
   double get _routeCenterMinX {
     final width = PlotImporter.measure(strokes).width;
-    return (width / 2).clamp(0.0, _travel / 2).toDouble();
+    return (width / 2).clamp(0.0, limits.maxX / 2).toDouble();
   }
 
-  double get _routeCenterMaxX => _travel - _routeCenterMinX;
+  double get _routeCenterMaxX => limits.maxX - _routeCenterMinX;
 
   double get _routeCenterMinY {
     final height = PlotImporter.measure(strokes).height;
-    return (height / 2).clamp(0.0, _travel / 2).toDouble();
+    return (height / 2).clamp(0.0, limits.maxY / 2).toDouble();
   }
 
-  double get _routeCenterMaxY => _travel - _routeCenterMinY;
+  double get _routeCenterMaxY => limits.maxY - _routeCenterMinY;
 
   @override
   Widget build(BuildContext context) {
@@ -1756,7 +2242,7 @@ class _DrawingPanel extends StatelessWidget {
                       onSelectionChanged: drawingLocked
                           ? null
                           : (selection) =>
-                              onSvgTraceModeChanged(selection.first),
+                                onSvgTraceModeChanged(selection.first),
                     ),
                   ],
                 ),
@@ -1789,7 +2275,8 @@ class _DrawingPanel extends StatelessWidget {
           const SizedBox(height: 6),
           LayoutBuilder(
             builder: (context, constraints) {
-              final side = math.min(430.0, constraints.maxWidth);
+              final maxHeight = MediaQuery.sizeOf(context).height * .8;
+              final side = math.min(constraints.maxWidth, maxHeight);
               return Center(
                 child: SizedBox.square(
                   dimension: side,
@@ -1831,6 +2318,9 @@ class _DrawingPanel extends StatelessWidget {
                           current: fullyReferenced
                               ? Offset(snapshot.x, snapshot.y)
                               : null,
+                          limits: limits,
+                          preview: showRoutePreview ? routePreview : null,
+                          previewProgress: previewProgress,
                         ),
                         child: const SizedBox.expand(),
                       ),
@@ -1839,6 +2329,20 @@ class _DrawingPanel extends StatelessWidget {
                 ),
               );
             },
+          ),
+          const SizedBox(height: 12),
+          _RoutePreviewControls(
+            preview: routePreview,
+            visible: showRoutePreview,
+            playing: previewPlaying,
+            progress: previewProgress,
+            feedrate: feedrate,
+            penLiftMm: penLiftMm,
+            enabled: !running,
+            onVisibleChanged: onShowRoutePreviewChanged,
+            onTogglePlayback: onTogglePreviewPlayback,
+            onSeek: onSeekPreview,
+            onOptimize: onOptimizeRoute,
           ),
           const SizedBox(height: 12),
           if (_canResizeRoute) ...[
@@ -2047,9 +2551,9 @@ class _DrawingPanel extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 10),
-          const Text(
-            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Ao importar, a rota inicia em 100 mm no lado maior, sem ocupar a mesa automaticamente. Ajuste largura, altura, rotação e centro X/Y, ou use OCUPAR A MESA quando decidir preencher os 220 × 220 mm. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
-            style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
+          Text(
+            'Imagem P/B gera o contorno do preto; SVG aceita caminhos e formas. Ao importar, a rota inicia em 100 mm no lado maior, sem ocupar a mesa automaticamente. Ajuste largura, altura, rotação e centro X/Y, ou use OCUPAR A MESA quando decidir preencher o perfil ${limits.label}. Entre traços a caneta sobe a elevação configurada. O buzzer não tem volume por G-code: use BIP CURTO ou SEM SOM para reduzir o incômodo.',
+            style: const TextStyle(color: NeoCncColors.muted, fontSize: 11),
           ),
         ],
       ),
@@ -2058,17 +2562,17 @@ class _DrawingPanel extends StatelessWidget {
 
   Offset _toMachine(Offset local, Size size) {
     return Offset(
-      (local.dx / size.width * _travel).clamp(0.0, _travel).toDouble(),
-      (_travel - local.dy / size.height * _travel)
-          .clamp(0.0, _travel)
+      (local.dx / size.width * limits.maxX).clamp(0.0, limits.maxX).toDouble(),
+      (limits.maxY - local.dy / size.height * limits.maxY)
+          .clamp(0.0, limits.maxY)
           .toDouble(),
     );
   }
 
   Offset _toMachineDelta(Offset delta, Size size) {
     return Offset(
-      delta.dx / size.width * _travel,
-      -delta.dy / size.height * _travel,
+      delta.dx / size.width * limits.maxX,
+      -delta.dy / size.height * limits.maxY,
     );
   }
 }
@@ -2115,13 +2619,155 @@ class _DrawHeightControl extends StatelessWidget {
   }
 }
 
-class _DrawingPainter extends CustomPainter {
-  const _DrawingPainter({required this.strokes, required this.current});
+/// Prévia do percurso: liga o desenho dos deslocamentos, roda a caneta
+/// virtual e mostra quanto a máquina anda desenhando, quanto anda à toa e
+/// quanto tempo a rota deve levar.
+class _RoutePreviewControls extends StatelessWidget {
+  const _RoutePreviewControls({
+    required this.preview,
+    required this.visible,
+    required this.playing,
+    required this.progress,
+    required this.feedrate,
+    required this.penLiftMm,
+    required this.enabled,
+    required this.onVisibleChanged,
+    required this.onTogglePlayback,
+    required this.onSeek,
+    required this.onOptimize,
+  });
 
-  static const _travel = 220.0;
+  final RoutePreview preview;
+  final bool visible;
+  final bool playing;
+  final double progress;
+  final double feedrate;
+  final double penLiftMm;
+  final bool enabled;
+  final ValueChanged<bool> onVisibleChanged;
+  final VoidCallback onTogglePlayback;
+  final ValueChanged<double> onSeek;
+  final VoidCallback onOptimize;
+
+  String _duration(Duration value) {
+    if (value.inMinutes >= 60) {
+      final hours = value.inHours;
+      final minutes = value.inMinutes.remainder(60);
+      return '${hours}h${minutes.toString().padLeft(2, '0')}';
+    }
+    if (value.inMinutes >= 1) {
+      final minutes = value.inMinutes;
+      final seconds = value.inSeconds.remainder(60);
+      return '${minutes}min${seconds.toString().padLeft(2, '0')}';
+    }
+    return '${value.inSeconds}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final available = !preview.isEmpty && enabled;
+    final estimate = preview.estimate(
+      feedrateMmPerSecond: feedrate,
+      penLiftMm: penLiftMm,
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            OutlinedButton.icon(
+              onPressed: available ? () => onVisibleChanged(!visible) : null,
+              icon: Icon(
+                visible
+                    ? Icons.visibility_rounded
+                    : Icons.visibility_outlined,
+              ),
+              label: Text(
+                visible ? 'PERCURSO VISÍVEL' : 'VER O PERCURSO',
+              ),
+            ),
+            if (visible && available)
+              FilledButton.tonalIcon(
+                onPressed: onTogglePlayback,
+                icon: Icon(
+                  playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                ),
+                label: Text(playing ? 'PAUSAR' : 'SIMULAR'),
+              ),
+            OutlinedButton.icon(
+              onPressed: available && preview.strokeCount > 1
+                  ? onOptimize
+                  : null,
+              icon: const Icon(Icons.route_rounded),
+              label: const Text('OTIMIZAR ORDEM'),
+            ),
+            if (!preview.isEmpty)
+              Text(
+                'DESENHO ${preview.drawLength.round()} mm  •  '
+                'DESLOCAMENTO ${preview.travelLength.round()} mm  •  '
+                '${preview.penLifts} SUBIDA(S)  •  ~${_duration(estimate)}',
+                style: const TextStyle(
+                  color: NeoCncColors.muted,
+                  fontSize: 11,
+                ),
+              ),
+          ],
+        ),
+        if (visible && available) ...[
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Expanded(
+                child: Slider(
+                  value: progress.clamp(0.0, 1.0),
+                  onChanged: onSeek,
+                ),
+              ),
+              SizedBox(
+                width: 96,
+                child: Text(
+                  '${(progress.clamp(0.0, 1.0) * 100).round()}%  '
+                  '${(preview.totalLength * progress.clamp(0.0, 1.0)).round()} mm',
+                  style: const TextStyle(
+                    color: NeoCncColors.cyan,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const Text(
+            'Linha cheia é caneta baixa; tracejado é deslocamento com a caneta '
+            'levantada. Arraste a barra para percorrer a rota.',
+            style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _DrawingPainter extends CustomPainter {
+  const _DrawingPainter({
+    required this.strokes,
+    required this.current,
+    required this.limits,
+    this.preview,
+    this.previewProgress = 0,
+  });
 
   final List<List<Offset>> strokes;
   final Offset? current;
+  final MachineLimits limits;
+
+  /// Quando presente, desenha o percurso da ferramenta em vez da rota crua:
+  /// deslocamentos com a caneta levantada tracejados e o trecho já percorrido
+  /// destacado até [previewProgress].
+  final RoutePreview? preview;
+  final double previewProgress;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -2135,11 +2781,15 @@ class _DrawingPainter extends CustomPainter {
       ..color = NeoCncColors.line.withValues(alpha: .55)
       ..strokeWidth = 1;
     canvas.drawRect(area, background);
-    for (var mm = 20.0; mm < _travel; mm += 20) {
-      final x = mm / _travel * size.width;
-      final y = size.height - mm / _travel * size.height;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+    for (var mm = 20.0; mm < limits.maxX || mm < limits.maxY; mm += 20) {
+      if (mm < limits.maxX) {
+        final x = mm / limits.maxX * size.width;
+        canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
+      }
+      if (mm < limits.maxY) {
+        final y = size.height - mm / limits.maxY * size.height;
+        canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+      }
     }
     canvas.drawRect(area.deflate(.75), border);
 
@@ -2150,21 +2800,26 @@ class _DrawingPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
     final point = Paint()..color = NeoCncColors.cyan;
-    for (final stroke in strokes) {
-      if (stroke.isEmpty) {
-        continue;
+    final activePreview = preview;
+    if (activePreview != null && !activePreview.isEmpty) {
+      _paintPreview(canvas, size, activePreview);
+    } else {
+      for (final stroke in strokes) {
+        if (stroke.isEmpty) {
+          continue;
+        }
+        final path = Path()
+          ..moveTo(
+            _toCanvas(stroke.first, size).dx,
+            _toCanvas(stroke.first, size).dy,
+          );
+        for (final value in stroke.skip(1)) {
+          final canvasPoint = _toCanvas(value, size);
+          path.lineTo(canvasPoint.dx, canvasPoint.dy);
+        }
+        canvas.drawPath(path, route);
+        canvas.drawCircle(_toCanvas(stroke.first, size), 3.5, point);
       }
-      final path = Path()
-        ..moveTo(
-          _toCanvas(stroke.first, size).dx,
-          _toCanvas(stroke.first, size).dy,
-        );
-      for (final value in stroke.skip(1)) {
-        final canvasPoint = _toCanvas(value, size);
-        path.lineTo(canvasPoint.dx, canvasPoint.dy);
-      }
-      canvas.drawPath(path, route);
-      canvas.drawCircle(_toCanvas(stroke.first, size), 3.5, point);
     }
     if (current != null && _isWithin(current!)) {
       final machinePoint = _toCanvas(current!, size);
@@ -2186,16 +2841,115 @@ class _DrawingPainter extends CustomPainter {
     }
   }
 
+  /// Desenha o percurso: o que já foi percorrido em destaque, o que falta
+  /// apagado, e os deslocamentos com a caneta levantada tracejados.
+  void _paintPreview(Canvas canvas, Size size, RoutePreview preview) {
+    final doneDraw = Paint()
+      ..color = NeoCncColors.amber
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.4
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final pendingDraw = Paint()
+      ..color = NeoCncColors.amber.withValues(alpha: .22)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final doneTravel = Paint()
+      ..color = NeoCncColors.cyan.withValues(alpha: .75)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1;
+    final pendingTravel = Paint()
+      ..color = NeoCncColors.cyan.withValues(alpha: .18)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1;
+
+    final target = preview.totalLength * previewProgress.clamp(0.0, 1.0);
+    var walked = 0.0;
+    for (final move in preview.moves) {
+      final from = _toCanvas(move.from, size);
+      final to = _toCanvas(move.to, size);
+      final end = walked + move.length;
+      final done = end <= target;
+      final partial = !done && walked < target && move.length > 0;
+      if (move.drawing) {
+        canvas.drawLine(from, to, done ? doneDraw : pendingDraw);
+        if (partial) {
+          canvas.drawLine(
+            from,
+            Offset.lerp(from, to, (target - walked) / move.length)!,
+            doneDraw,
+          );
+        }
+      } else {
+        _dashedLine(canvas, from, to, done ? doneTravel : pendingTravel);
+        if (partial) {
+          _dashedLine(
+            canvas,
+            from,
+            Offset.lerp(from, to, (target - walked) / move.length)!,
+            doneTravel,
+          );
+        }
+      }
+      walked = end;
+    }
+
+    // Onde cada traço começa, para dar noção da ordem.
+    final startDot = Paint()..color = NeoCncColors.cyan.withValues(alpha: .8);
+    for (final stroke in strokes) {
+      if (stroke.length >= 2) {
+        canvas.drawCircle(_toCanvas(stroke.first, size), 2.4, startDot);
+      }
+    }
+
+    // A caneta virtual: cheia quando desenhando, vazada quando só se desloca.
+    final sample = preview.sampleAt(target);
+    final head = _toCanvas(sample.position, size);
+    canvas.drawCircle(
+      head,
+      6,
+      Paint()
+        ..color = (sample.drawing ? NeoCncColors.amber : NeoCncColors.cyan)
+            .withValues(alpha: .25),
+    );
+    canvas.drawCircle(
+      head,
+      3.4,
+      Paint()
+        ..color = sample.drawing ? NeoCncColors.amber : NeoCncColors.cyan
+        ..style = sample.drawing ? PaintingStyle.fill : PaintingStyle.stroke
+        ..strokeWidth = 1.6,
+    );
+  }
+
+  void _dashedLine(Canvas canvas, Offset from, Offset to, Paint paint) {
+    const dash = 4.0;
+    const gap = 3.0;
+    final total = (to - from).distance;
+    if (total <= 0) {
+      return;
+    }
+    final step = (to - from) / total;
+    var walked = 0.0;
+    while (walked < total) {
+      final end = math.min(walked + dash, total);
+      canvas.drawLine(from + step * walked, from + step * end, paint);
+      walked = end + gap;
+    }
+  }
+
   Offset _toCanvas(Offset point, Size size) => Offset(
-    point.dx / _travel * size.width,
-    size.height - point.dy / _travel * size.height,
+    point.dx / limits.maxX * size.width,
+    size.height - point.dy / limits.maxY * size.height,
   );
 
   bool _isWithin(Offset point) =>
       point.dx >= 0 &&
-      point.dx <= _travel &&
+      point.dx <= limits.maxX &&
       point.dy >= 0 &&
-      point.dy <= _travel;
+      point.dy <= limits.maxY;
 
   @override
   bool shouldRepaint(covariant _DrawingPainter oldDelegate) => true;

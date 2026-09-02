@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import '../../job/data/marlin_binary_protocol.dart';
+import '../../job/data/marlin_file_transfer.dart';
 import '../data/printer_transport.dart';
 import '../data/usb_serial_transport.dart';
 import '../domain/drawing_point.dart';
@@ -34,6 +37,11 @@ class PrinterController extends ChangeNotifier {
   int _drawingCompletedSegments = 0;
   int _drawingSegmentCount = 0;
   bool _disposed = false;
+  bool _uploading = false;
+  double _uploadProgress = 0;
+  bool _binaryModeActive = false;
+  DateTime _lastProgressNotify = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _sdJobName;
 
   PrinterSnapshot get snapshot => _snapshot;
   List<String> get ports => List.unmodifiable(_ports);
@@ -45,6 +53,13 @@ class PrinterController extends ChangeNotifier {
   bool get isDrawing => _isDrawing;
   int get drawingCompletedSegments => _drawingCompletedSegments;
   int get drawingSegmentCount => _drawingSegmentCount;
+  bool get isUploading => _uploading;
+  double get uploadProgress => _uploadProgress;
+
+  /// Arquivo selecionado por `M23`, ou `null` quando nenhum trabalho roda.
+  String? get sdJobName => _sdJobName;
+  bool get isRunningSdJob => _sdJobName != null;
+  bool get isBusy => _isDrawing || _uploading || isRunningSdJob;
 
   Future<void> refreshPorts() async {
     try {
@@ -56,14 +71,17 @@ class PrinterController extends ChangeNotifier {
     }
   }
 
-  Future<void> connect(String portName) async {
+  Future<void> connect(
+    String portName, {
+    int baudRate = UsbSerialTransport.defaultBaudRate,
+  }) async {
     if (portName.isEmpty) {
       throw ArgumentError.value(portName, 'portName', 'Selecione uma porta.');
     }
     await disconnect();
 
     try {
-      await _transport.connect(portName);
+      await _transport.connect(portName, baudRate: baudRate);
       _snapshot = _snapshot.copyWith(
         isConnected: true,
         portName: portName,
@@ -74,10 +92,12 @@ class PrinterController extends ChangeNotifier {
       _addLog('SYS > conectado em $portName');
       _notify();
 
+      await _waitForFirmware();
+      await refreshStatus(includeFirmwareInfo: false);
       _startStatusTimer();
-      await refreshStatus();
       await _enqueue(() => _setLcdMessage('NeoCNC conectado'));
     } catch (error) {
+      await disconnect();
       _recordError('Falha ao conectar: $error');
       rethrow;
     }
@@ -93,6 +113,10 @@ class PrinterController extends ChangeNotifier {
     _isDrawing = false;
     _drawingCompletedSegments = 0;
     _drawingSegmentCount = 0;
+    _uploading = false;
+    _uploadProgress = 0;
+    _binaryModeActive = false;
+    _sdJobName = null;
 
     await _transport.disconnect();
     _snapshot = _snapshot.copyWith(
@@ -105,14 +129,16 @@ class PrinterController extends ChangeNotifier {
     _notify();
   }
 
-  Future<void> refreshStatus() async {
+  Future<void> refreshStatus({bool includeFirmwareInfo = true}) async {
     if (!isConnected || _refreshInFlight) {
       return;
     }
     _refreshInFlight = true;
     try {
       await _enqueue(() async {
-        await _sendAndAwait('M115', timeout: const Duration(seconds: 4));
+        if (includeFirmwareInfo) {
+          await _sendAndAwait('M115', timeout: const Duration(seconds: 4));
+        }
         await _sendAndAwait('M105');
         await _sendAndAwait('M114');
         await _sendAndAwait('M119');
@@ -240,10 +266,7 @@ class PrinterController extends ChangeNotifier {
     if (!isFullyReferenced) {
       throw StateError('Faça HOME XY e HOME Z antes de desenhar.');
     }
-    if (penLiftMm <= 0 ||
-        penLiftMm > 250 ||
-        drawingZ < 0 ||
-        drawingZ > 250) {
+    if (penLiftMm <= 0 || penLiftMm > 250 || drawingZ < 0 || drawingZ > 250) {
       throw ArgumentError(
         'Configure a elevação e o Z de traço dentro do curso.',
       );
@@ -319,10 +342,7 @@ class PrinterController extends ChangeNotifier {
               timeout: const Duration(seconds: 30),
             );
           }
-          await _sendAndAwait(
-            'M400',
-            timeout: const Duration(minutes: 10),
-          );
+          await _sendAndAwait('M400', timeout: const Duration(minutes: 10));
           await _sendAndAwait('M114');
           await _setLcdMessage('NeoCNC: Desenho OK');
           await _playCompletionSound(completionSound);
@@ -335,6 +355,178 @@ class PrinterController extends ChangeNotifier {
       _isDrawing = false;
       _notify();
     }
+  }
+
+  /// Grava o trabalho no cartão da máquina pelo protocolo binário do Marlin
+  /// (`M28 B1` + BFT) em vez de transmitir G-code linha a linha.
+  ///
+  /// Streaming linha a linha custa um round-trip serial por segmento: numa
+  /// isolação de PCB com milhares de segmentos curtos o planner esvazia entre
+  /// os movimentos e a fresa marca o cobre a cada parada. Rodando do cartão a
+  /// máquina lê no próprio ritmo e o trabalho sobrevive a uma desconexão USB.
+  Future<void> uploadJob({
+    required String gcode,
+    required String remoteName,
+    void Function(double progress)? onProgress,
+  }) async {
+    if (!isConnected) {
+      throw StateError('Impressora não está conectada.');
+    }
+    if (isBusy) {
+      throw StateError('Já existe uma operação em andamento.');
+    }
+    final name = _normalizeSdName(remoteName);
+    final bytes = Uint8List.fromList(utf8.encode(gcode));
+    if (bytes.isEmpty) {
+      throw ArgumentError('O trabalho está vazio.');
+    }
+
+    await _enqueue(() async {
+      _refreshTimer?.cancel();
+      _refreshTimer = null;
+      _uploading = true;
+      _uploadProgress = 0;
+      _notify();
+
+      final protocol = MarlinBinaryProtocol(_transport);
+      final transfer = MarlinFileTransfer(protocol);
+      try {
+        await _setLcdMessage('NeoCNC: Enviando');
+        await _sendAndAwait('M21', timeout: const Duration(seconds: 15));
+        try {
+          await _sendAndAwait(
+            'M30 /$name',
+            timeout: const Duration(seconds: 15),
+          );
+        } catch (error) {
+          _addLog('WARN > $name não existia no cartão: $error');
+        }
+
+        _binaryModeActive = true;
+        var binarySessionMayBeOpen = false;
+        try {
+          binarySessionMayBeOpen = true;
+          await protocol.connect();
+          await transfer.copy(
+            bytes,
+            name,
+            onProgress: (progress) {
+              _uploadProgress = progress;
+              onProgress?.call(progress);
+              _notifyProgress();
+            },
+          );
+        } finally {
+          if (binarySessionMayBeOpen) {
+            try {
+              // Mesmo se o envio falhar, feche M28 B1 antes de voltar ao
+              // ASCII. Sem isso a máquina fica presa em binário até reiniciar.
+              await protocol.disconnect();
+            } catch (error) {
+              _addLog('WARN > não foi possível fechar BFT: $error');
+            }
+          }
+          await protocol.shutdown();
+          _binaryModeActive = false;
+        }
+
+        await _sendAndAwait('M21', timeout: const Duration(seconds: 15));
+        _addLog('SYS > $name gravado no cartão (${bytes.length} bytes)');
+        await _setLcdMessage('NeoCNC: Arquivo OK');
+      } catch (error) {
+        _binaryModeActive = false;
+        await _setLcdMessage('NeoCNC: Envio ERRO');
+        _recordError('Falha ao enviar $name: $error');
+        rethrow;
+      } finally {
+        _uploading = false;
+        _uploadProgress = 0;
+        if (isConnected) {
+          _startStatusTimer();
+        }
+        _notify();
+      }
+    });
+  }
+
+  /// Seleciona e inicia um arquivo já gravado no cartão.
+  Future<void> startSdJob(String remoteName) async {
+    if (!isFullyReferenced) {
+      throw StateError('Faça HOME XY e HOME Z antes de iniciar um trabalho.');
+    }
+    if (isBusy) {
+      throw StateError('Já existe uma operação em andamento.');
+    }
+    final name = _normalizeSdName(remoteName);
+    await _enqueue(() async {
+      await _sendAndAwait('M21', timeout: const Duration(seconds: 15));
+      await _sendAndAwait('M23 $name', timeout: const Duration(seconds: 15));
+      await _sendAndAwait('M24', timeout: const Duration(seconds: 15));
+      await _setLcdMessage('NeoCNC: $name');
+    });
+    _sdJobName = name;
+    _notify();
+  }
+
+  Future<void> pauseSdJob() => _enqueue(() async {
+    await _sendAndAwait('M25', timeout: const Duration(seconds: 15));
+    await _setLcdMessage('NeoCNC: Pausado');
+  });
+
+  Future<void> resumeSdJob() => _enqueue(() async {
+    await _sendAndAwait('M24', timeout: const Duration(seconds: 15));
+    await _setLcdMessage('NeoCNC: Retomado');
+  });
+
+  /// Aborta o trabalho e desliga a ferramenta.
+  Future<void> abortSdJob() async {
+    await _enqueue(() async {
+      await _sendAndAwait('M524', timeout: const Duration(seconds: 15));
+      await _sendAndAwait('M5', timeout: const Duration(seconds: 20));
+      await _setLcdMessage('NeoCNC: Abortado');
+    });
+    _sdJobName = null;
+    _notify();
+  }
+
+  /// Liga a microrretífica. `M3` espera `SPINDLE_LASER_POWERUP_DELAY` antes de
+  /// devolver o `ok`, por isso o timeout é folgado.
+  Future<void> spindleOn({int power = 255}) {
+    if (power < 0 || power > 255) {
+      throw ArgumentError.value(power, 'power', 'Use um valor entre 0 e 255.');
+    }
+    return _enqueue(
+      () => _sendAndAwait('M3 S$power', timeout: const Duration(seconds: 30)),
+    );
+  }
+
+  Future<void> spindleOff() =>
+      _enqueue(() => _sendAndAwait('M5', timeout: const Duration(seconds: 30)));
+
+  static final RegExp _sdNamePattern = RegExp(
+    r'^[A-Z0-9_~-]{1,8}\.[A-Z0-9]{1,3}$',
+  );
+
+  static String _normalizeSdName(String name) {
+    final normalized = name.trim().toUpperCase();
+    if (!_sdNamePattern.hasMatch(normalized)) {
+      throw ArgumentError.value(
+        name,
+        'remoteName',
+        'O cartão só aceita nomes 8.3 (ex.: ISOLA01.GCO).',
+      );
+    }
+    return normalized;
+  }
+
+  void _notifyProgress() {
+    final now = DateTime.now();
+    if (now.difference(_lastProgressNotify) <
+        const Duration(milliseconds: 150)) {
+      return;
+    }
+    _lastProgressNotify = now;
+    _notify();
   }
 
   Future<void> enableSteppers() => _enqueue(() => _sendAndAwait('M17'));
@@ -364,6 +556,29 @@ class PrinterController extends ChangeNotifier {
     final next = _commandTail.then((_) => action());
     _commandTail = next.then<void>((_) {}, onError: (error, stackTrace) {});
     return next;
+  }
+
+  Future<void> _waitForFirmware() async {
+    Object? lastError;
+
+    // Abrir a CH340 pode reiniciar a placa. Aguarde e repita a identificação
+    // em vez de tratar o primeiro M115 perdido durante o boot como desconexão.
+    for (var attempt = 1; attempt <= 6; attempt++) {
+      try {
+        await _sendAndAwait('M115', timeout: const Duration(seconds: 3));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt == 6) {
+          break;
+        }
+        _addLog('SYS > aguardando Marlin iniciar ($attempt/6)');
+        _notify();
+        await Future<void>.delayed(const Duration(milliseconds: 750));
+      }
+    }
+
+    throw StateError('Marlin não respondeu ao M115: $lastError');
   }
 
   Future<void> _sendAndAwait(
@@ -427,6 +642,9 @@ class PrinterController extends ChangeNotifier {
   }
 
   void _onLine(String line) {
+    if (_binaryModeActive) {
+      return;
+    }
     _addLog('RX  < $line');
     _parseLine(line);
     _pendingCommand?.consume(line);
@@ -479,8 +697,25 @@ class PrinterController extends ChangeNotifier {
       _snapshot = _snapshot.copyWith(endstops: values);
     }
 
-    if (line.startsWith('SD printing') || line.startsWith('Not SD printing')) {
-      _snapshot = _snapshot.copyWith(sdStatus: line);
+    if (line.startsWith('SD printing')) {
+      final progress = RegExp(r'(\d+)\s*/\s*(\d+)').firstMatch(line);
+      _snapshot = _snapshot.copyWith(
+        sdStatus: line,
+        sdBytesDone: progress == null ? null : int.parse(progress.group(1)!),
+        sdBytesTotal: progress == null ? null : int.parse(progress.group(2)!),
+      );
+    } else if (line.startsWith('Not SD printing')) {
+      _snapshot = _snapshot.copyWith(
+        sdStatus: line,
+        sdBytesDone: 0,
+        sdBytesTotal: 0,
+      );
+    }
+
+    if (line.startsWith('Done printing file')) {
+      _sdJobName = null;
+      _snapshot = _snapshot.copyWith(sdBytesDone: 0, sdBytesTotal: 0);
+      _addLog('SYS > trabalho concluído');
     }
 
     if (line.contains('FIRMWARE_NAME:')) {
@@ -496,8 +731,17 @@ class PrinterController extends ChangeNotifier {
   void _startStatusTimer() {
     _refreshTimer?.cancel();
     _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      unawaited(refreshStatus());
+      unawaited(_refreshFromTimer());
     });
+  }
+
+  Future<void> _refreshFromTimer() async {
+    try {
+      await refreshStatus(includeFirmwareInfo: false);
+    } catch (error) {
+      _addLog('WARN > telemetria indisponível: $error');
+      _notify();
+    }
   }
 
   void _recordError(String message) {

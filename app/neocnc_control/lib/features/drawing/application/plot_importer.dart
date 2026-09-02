@@ -67,11 +67,15 @@ abstract final class PlotImporter {
     List<List<ui.Offset>> strokes, {
     required double width,
     required double height,
+    double maxX = _bedSize,
+    double maxY = _bedSize,
   }) => resizeRotateAndCenter(
     strokes,
     width: width,
     height: height,
     rotationDegrees: 0,
+    maxX: maxX,
+    maxY: maxY,
   );
 
   static List<List<ui.Offset>> resizeRotateAndCenter(
@@ -80,9 +84,14 @@ abstract final class PlotImporter {
     required double height,
     required double rotationDegrees,
     ui.Offset? center,
+    double maxX = _bedSize,
+    double maxY = _bedSize,
   }) {
-    if (width <= 0 || height <= 0 || width > _bedSize || height > _bedSize) {
-      throw ArgumentError('O tamanho da rota deve ficar entre 0 e 220 mm.');
+    if (width <= 0 || height <= 0 || width > maxX || height > maxY) {
+      throw ArgumentError(
+        'O tamanho da rota deve ficar entre 0 e '
+        '${maxX.toStringAsFixed(0)} × ${maxY.toStringAsFixed(0)} mm.',
+      );
     }
     if (!rotationDegrees.isFinite) {
       throw ArgumentError.value(
@@ -91,7 +100,7 @@ abstract final class PlotImporter {
         'A rotação deve ser um número válido.',
       );
     }
-    final targetCenter = center ?? const ui.Offset(110, 110);
+    final targetCenter = center ?? ui.Offset(maxX / 2, maxY / 2);
     if (!targetCenter.dx.isFinite || !targetCenter.dy.isFinite) {
       throw ArgumentError.value(
         center,
@@ -124,8 +133,8 @@ abstract final class PlotImporter {
     final fit = math.min(
       1.0,
       math.min(
-        _bedSize / math.max(.1, rotatedBounds.width),
-        _bedSize / math.max(.1, rotatedBounds.height),
+        maxX / math.max(.1, rotatedBounds.width),
+        maxY / math.max(.1, rotatedBounds.height),
       ),
     );
     final rotatedCenter = ui.Offset(
@@ -408,9 +417,34 @@ abstract final class PlotImporter {
     return (outStrokes, outIds);
   }
 
-  static const _skeletonShortSidePixels = 14.0;
-  static const _skeletonMaxLongSidePixels = 260.0;
-  static const _skeletonMaxCells = 160000;
+  /// Quantos pixels a espessura do traço deve ocupar no raster: abaixo de
+  /// ~6 px o afinamento deixa degraus; acima disso só custa tempo.
+  static const _skeletonStrokePixels = 6.0;
+  static const _skeletonMinStrokePixels = 3.5;
+  static const _skeletonMaxCells = 150000;
+
+  /// Espessura média do traço de uma forma preenchida, por área e perímetro:
+  /// numa fita de largura w e comprimento L, área ≈ w·L e perímetro ≈ 2L.
+  static double _estimateStrokeWidth(List<List<ui.Offset>> polygons) {
+    var area = 0.0;
+    var perimeter = 0.0;
+    for (final polygon in polygons) {
+      if (polygon.length < 3) {
+        continue;
+      }
+      for (var i = 0; i < polygon.length; i++) {
+        final p1 = polygon[i];
+        final p2 = polygon[(i + 1) % polygon.length];
+        area += p1.dx * p2.dy - p2.dx * p1.dy;
+        perimeter += (p2 - p1).distance;
+      }
+    }
+    area = area.abs() / 2;
+    if (area <= 0 || perimeter <= 0) {
+      return 0;
+    }
+    return 2 * area / perimeter;
+  }
 
   static List<List<ui.Offset>> _skeletonize(List<List<ui.Offset>> polygons) {
     var minX = double.infinity;
@@ -430,24 +464,36 @@ abstract final class PlotImporter {
     }
     final width = math.max(.05, maxX - minX);
     final height = math.max(.05, maxY - minY);
-    final shortSide = math.min(width, height);
-    var scale = _skeletonShortSidePixels / shortSide;
-    final longSidePixels = math.max(width, height) * scale;
-    if (longSidePixels > _skeletonMaxLongSidePixels) {
-      scale *= _skeletonMaxLongSidePixels / longSidePixels;
-    }
-    final gridWidth = ((width * scale).ceil() + 2).clamp(3, 400).toInt();
-    final gridHeight = ((height * scale).ceil() + 2).clamp(3, 400).toInt();
-    if (gridWidth * gridHeight > _skeletonMaxCells) {
+    // A resolução tem que sair da espessura do traço, não do bounding box:
+    // numa letra cursiva o bbox é a altura da letra, mas o traço é fino, e
+    // rasterizar pelo bbox achataria tudo em 1 px (o esqueleto viraria lixo).
+    // Para uma fita de largura w e comprimento L: área ≈ w·L e perímetro ≈ 2L,
+    // logo w ≈ 2·área/perímetro.
+    final strokeWidth = _estimateStrokeWidth(polygons);
+    if (strokeWidth <= 0) {
       return const [];
     }
+    var scale = _skeletonStrokePixels / strokeWidth;
+    var gridWidth = (width * scale).ceil() + 2;
+    var gridHeight = (height * scale).ceil() + 2;
+    if (gridWidth * gridHeight > _skeletonMaxCells) {
+      scale *= math.sqrt(_skeletonMaxCells / (gridWidth * gridHeight));
+      gridWidth = (width * scale).ceil() + 2;
+      gridHeight = (height * scale).ceil() + 2;
+    }
+    // Sem pixels suficientes na largura do traço o afinamento não converge
+    // para o eixo central: melhor devolver vazio e deixar cair no contorno.
+    if (strokeWidth * scale < _skeletonMinStrokePixels) {
+      return const [];
+    }
+    gridWidth = gridWidth.clamp(3, 4000).toInt();
+    gridHeight = gridHeight.clamp(3, 4000).toInt();
 
-    final mask = List<List<bool>>.generate(
-      gridHeight,
-      (_) => List<bool>.filled(gridWidth, false),
-    );
-    for (var row = 0; row < gridHeight; row++) {
-      final y = minY + (row + .5) / scale;
+    final mask = Uint8List(gridWidth * gridHeight);
+    // A moldura de 1 px fica sempre vazia: o afinamento não processa a borda
+    // do raster, então nada de conteúdo pode encostar nela.
+    for (var row = 1; row < gridHeight - 1; row++) {
+      final y = minY + (row - 1 + .5) / scale;
       final crossings = <_Crossing>[];
       for (final polygon in polygons) {
         if (polygon.length < 2) {
@@ -478,71 +524,196 @@ abstract final class PlotImporter {
         if (winding == 0) {
           continue;
         }
-        var colStart = ((crossings[i].x - minX) * scale).floor();
-        var colEnd = ((crossings[i + 1].x - minX) * scale).ceil();
-        colStart = colStart.clamp(0, gridWidth - 1);
-        colEnd = colEnd.clamp(0, gridWidth - 1);
+        var colStart = ((crossings[i].x - minX) * scale).floor() + 1;
+        var colEnd = ((crossings[i + 1].x - minX) * scale).ceil() + 1;
+        colStart = colStart.clamp(1, gridWidth - 2);
+        colEnd = colEnd.clamp(1, gridWidth - 2);
+        final rowOffset = row * gridWidth;
         for (var col = colStart; col <= colEnd; col++) {
-          mask[row][col] = true;
+          mask[rowOffset + col] = 1;
         }
       }
     }
 
     _thin(mask, gridWidth, gridHeight);
-    final pixelLines = _vectorizeSkeleton(mask, gridWidth, gridHeight);
+    // Pontas de afinamento crescem com a espessura: podar por um comprimento
+    // proporcional evita que cada curva feche um "galho" e parta a linha.
+    final pruneLength = (strokeWidth * scale * 1.6).round().clamp(4, 40);
+    final pixelLines = _joinLines(
+      _vectorizeSkeleton(
+        mask,
+        gridWidth,
+        gridHeight,
+        pruneLength: pruneLength,
+      ),
+      tolerance: 1.5,
+      redundantLimit: pruneLength.toDouble(),
+      coverageTolerance: strokeWidth * scale * .5,
+    );
     if (pixelLines.isEmpty) {
       return const [];
     }
     return pixelLines
         .map(
-          (line) => line
-              .map(
-                (point) => ui.Offset(
-                  minX + point.dx / scale,
-                  minY + point.dy / scale,
-                ),
-              )
-              .toList(growable: false),
+          (line) => _smooth(
+            line
+                .map(
+                  (point) => ui.Offset(
+                    minX + (point.dx - 1) / scale,
+                    minY + (point.dy - 1) / scale,
+                  ),
+                )
+                .toList(growable: false),
+          ),
         )
         .toList(growable: false);
   }
 
+  /// Emenda polilinhas cujas pontas se encontram (numa bifurcação, ou
+  /// separadas por um "degrau" de 1 px que o afinamento deixa): cada emenda é
+  /// uma subida de caneta a menos. Começa pelas linhas mais longas para o
+  /// traço principal ter prioridade, e descarta os cacos que sobram.
+  static List<List<ui.Offset>> _joinLines(
+    List<List<ui.Offset>> lines, {
+    required double tolerance,
+    required double redundantLimit,
+    required double coverageTolerance,
+  }) {
+    final pending = [
+      for (final line in lines)
+        if (line.length >= 2) List<ui.Offset>.from(line),
+    ]..sort((a, b) => _lengthOf(a).compareTo(_lengthOf(b)));
+    final joined = <List<ui.Offset>>[];
+    bool near(ui.Offset a, ui.Offset b) => (a - b).distance <= tolerance;
+
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      var extended = true;
+      while (extended) {
+        extended = false;
+        for (var i = pending.length - 1; i >= 0; i--) {
+          final other = pending[i];
+          if (near(other.last, current.first)) {
+            current.insertAll(0, other.sublist(0, other.length - 1));
+          } else if (near(other.first, current.first)) {
+            current.insertAll(0, other.reversed.skip(1).toList());
+          } else if (near(other.first, current.last)) {
+            current.addAll(other.skip(1));
+          } else if (near(other.last, current.last)) {
+            current.addAll(other.reversed.skip(1));
+          } else {
+            continue;
+          }
+          pending.removeAt(i);
+          extended = true;
+          break;
+        }
+      }
+      joined.add(current);
+    }
+    // Sobram os ramos paralelos das "bolhas" do afinamento: trechos curtos
+    // cujas duas pontas encostam num traço já mantido, ou seja, geometria
+    // duplicada. Mantém sempre a linha mais longa.
+    joined.sort((a, b) => _lengthOf(b).compareTo(_lengthOf(a)));
+    final kept = <List<ui.Offset>>[];
+    for (final line in joined) {
+      final length = _lengthOf(line);
+      if (kept.isNotEmpty && length <= redundantLimit) {
+        final startCovered = kept.any(
+          (other) =>
+              other.any((p) => (p - line.first).distance <= coverageTolerance),
+        );
+        final endCovered = kept.any(
+          (other) =>
+              other.any((p) => (p - line.last).distance <= coverageTolerance),
+        );
+        if (startCovered && endCovered) {
+          continue;
+        }
+      }
+      if (length > tolerance || kept.isEmpty) {
+        kept.add(line);
+      }
+    }
+    return kept.isEmpty ? joined : kept;
+  }
+
+  static double _lengthOf(List<ui.Offset> line) {
+    var total = 0.0;
+    for (var i = 0; i + 1 < line.length; i++) {
+      total += (line[i + 1] - line[i]).distance;
+    }
+    return total;
+  }
+
+  /// Média móvel de 3 pontos (mantendo as pontas) para tirar o serrilhado que
+  /// o esqueleto herda do raster.
+  static List<ui.Offset> _smooth(List<ui.Offset> line) {
+    if (line.length < 3) {
+      return line;
+    }
+    var current = line;
+    for (var pass = 0; pass < 2; pass++) {
+      final next = List<ui.Offset>.from(current);
+      for (var i = 1; i < current.length - 1; i++) {
+        next[i] = (current[i - 1] + current[i] * 2 + current[i + 1]) / 4;
+      }
+      current = next;
+    }
+    return current;
+  }
+
   /// Afinamento morfológico de Zhang-Suen: reduz uma área preenchida a um
   /// esqueleto de 1 pixel de largura, preservando a conectividade.
-  static void _thin(List<List<bool>> mask, int width, int height) {
-    bool at(int x, int y) =>
-        x >= 0 && x < width && y >= 0 && y < height && mask[y][x];
+  static void _thin(Uint8List mask, int width, int height) {
+    // Percorre só os pixels preenchidos (a lista encolhe a cada passada), em
+    // vez do raster inteiro: numa fita fina dentro de um bbox grande a maior
+    // parte das células está vazia.
+    var active = <int>[];
+    for (var y = 1; y < height - 1; y++) {
+      final rowOffset = y * width;
+      for (var x = 1; x < width - 1; x++) {
+        if (mask[rowOffset + x] != 0) {
+          active.add(rowOffset + x);
+        }
+      }
+    }
+    final toRemove = <int>[];
     var changed = true;
     var guard = 0;
     while (changed && guard < 300) {
       changed = false;
       guard++;
-      for (final step in [0, 1]) {
-        final toRemove = <List<int>>[];
-        for (var y = 1; y < height - 1; y++) {
-          for (var x = 1; x < width - 1; x++) {
-            if (!mask[y][x]) {
+      for (var step = 0; step < 2; step++) {
+        toRemove.clear();
+        final survivors = <int>[];
+        {
+          for (final index in active) {
+            if (mask[index] == 0) {
               continue;
             }
-            final p2 = at(x, y - 1) ? 1 : 0;
-            final p3 = at(x + 1, y - 1) ? 1 : 0;
-            final p4 = at(x + 1, y) ? 1 : 0;
-            final p5 = at(x + 1, y + 1) ? 1 : 0;
-            final p6 = at(x, y + 1) ? 1 : 0;
-            final p7 = at(x - 1, y + 1) ? 1 : 0;
-            final p8 = at(x - 1, y) ? 1 : 0;
-            final p9 = at(x - 1, y - 1) ? 1 : 0;
-            final neighbors = [p2, p3, p4, p5, p6, p7, p8, p9];
-            final blackNeighbors = neighbors.reduce((a, b) => a + b);
+            survivors.add(index);
+            final p2 = mask[index - width];
+            final p3 = mask[index - width + 1];
+            final p4 = mask[index + 1];
+            final p5 = mask[index + width + 1];
+            final p6 = mask[index + width];
+            final p7 = mask[index + width - 1];
+            final p8 = mask[index - 1];
+            final p9 = mask[index - width - 1];
+            final blackNeighbors = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
             if (blackNeighbors < 2 || blackNeighbors > 6) {
               continue;
             }
             var transitions = 0;
-            for (var k = 0; k < 8; k++) {
-              if (neighbors[k] == 0 && neighbors[(k + 1) % 8] == 1) {
-                transitions++;
-              }
-            }
+            if (p2 == 0 && p3 == 1) transitions++;
+            if (p3 == 0 && p4 == 1) transitions++;
+            if (p4 == 0 && p5 == 1) transitions++;
+            if (p5 == 0 && p6 == 1) transitions++;
+            if (p6 == 0 && p7 == 1) transitions++;
+            if (p7 == 0 && p8 == 1) transitions++;
+            if (p8 == 0 && p9 == 1) transitions++;
+            if (p9 == 0 && p2 == 1) transitions++;
             if (transitions != 1) {
               continue;
             }
@@ -555,20 +726,19 @@ abstract final class PlotImporter {
                 continue;
               }
             }
-            toRemove.add([x, y]);
+            toRemove.add(index);
           }
         }
+        active = survivors;
         if (toRemove.isNotEmpty) {
           changed = true;
           for (final cell in toRemove) {
-            mask[cell[1]][cell[0]] = false;
+            mask[cell] = 0;
           }
         }
       }
     }
   }
-
-  static const _skeletonSpurPruneLength = 6;
 
   /// Remove pontas curtas penduradas em bifurcações: ruído típico do
   /// afinamento (cantos e pontas arredondadas geram um "graveto" curto que,
@@ -576,6 +746,7 @@ abstract final class PlotImporter {
   static void _pruneSkeletonSpurs(
     List<int> points,
     Map<int, List<int>> neighborsOf,
+    int pruneLength,
   ) {
     for (var pass = 0; pass < 4; pass++) {
       final endpoints = [
@@ -597,7 +768,7 @@ abstract final class PlotImporter {
             break;
           }
           chain.add(current);
-          if (chain.length > _skeletonSpurPruneLength) {
+          if (chain.length > pruneLength) {
             break;
           }
           final forward = currentNeighbors.where((c) => c != previous);
@@ -608,7 +779,8 @@ abstract final class PlotImporter {
           current = forward.first;
         }
         final endNeighbors = neighborsOf[current];
-        final isSpur = chain.length <= _skeletonSpurPruneLength &&
+        final isSpur =
+            chain.length <= pruneLength &&
             endNeighbors != null &&
             endNeighbors.length >= 3;
         if (!isSpur) {
@@ -622,7 +794,6 @@ abstract final class PlotImporter {
           for (final neighbor in pixelNeighbors) {
             neighborsOf[neighbor]?.remove(pixel);
           }
-          points.remove(pixel);
         }
         prunedAny = true;
       }
@@ -635,18 +806,25 @@ abstract final class PlotImporter {
   /// Percorre um esqueleto de 1 pixel e monta polilinhas entre pontas e
   /// bifurcações (e laços fechados isolados que sobrarem).
   static List<List<ui.Offset>> _vectorizeSkeleton(
-    List<List<bool>> mask,
+    Uint8List mask,
     int width,
-    int height,
-  ) {
+    int height, {
+    required int pruneLength,
+  }) {
     const orthogonal = [
-      [0, -1], [1, 0], [0, 1], [-1, 0],
+      [0, -1],
+      [1, 0],
+      [0, 1],
+      [-1, 0],
     ];
     const diagonal = [
-      [1, -1], [1, 1], [-1, 1], [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+      [-1, -1],
     ];
     bool at(int x, int y) =>
-        x >= 0 && x < width && y >= 0 && y < height && mask[y][x];
+        x >= 0 && x < width && y >= 0 && y < height && mask[y * width + x] != 0;
     int keyOf(int x, int y) => y * width + x;
     ui.Offset pointFor(int key) =>
         ui.Offset((key % width).toDouble(), (key ~/ width).toDouble());
@@ -655,7 +833,7 @@ abstract final class PlotImporter {
     final points = <int>[];
     for (var y = 0; y < height; y++) {
       for (var x = 0; x < width; x++) {
-        if (!mask[y][x]) {
+        if (mask[y * width + x] == 0) {
           continue;
         }
         final key = keyOf(x, y);
@@ -685,7 +863,7 @@ abstract final class PlotImporter {
     if (points.isEmpty) {
       return const [];
     }
-    _pruneSkeletonSpurs(points, neighborsOf);
+    _pruneSkeletonSpurs(points, neighborsOf, pruneLength);
 
     final consumed = <int>{};
     int edgeKey(int a, int b) => a < b ? a * 1000000 + b : b * 1000000 + a;
@@ -715,11 +893,14 @@ abstract final class PlotImporter {
     }
 
     final lines = <List<ui.Offset>>[];
+    // Primeiro as pontas e bifurcações (as cadeias abertas), depois o que
+    // sobrar de laço fechado. Pixels podados saíram de [neighborsOf].
     for (final key in points) {
-      if (neighborsOf[key]!.length == 2) {
+      final neighbors = neighborsOf[key];
+      if (neighbors == null || neighbors.length == 2) {
         continue;
       }
-      for (final neighbor in neighborsOf[key]!) {
+      for (final neighbor in neighbors) {
         if (consumed.contains(edgeKey(key, neighbor))) {
           continue;
         }
@@ -730,10 +911,11 @@ abstract final class PlotImporter {
       }
     }
     for (final key in points) {
-      if (neighborsOf[key]!.length != 2) {
+      final neighbors = neighborsOf[key];
+      if (neighbors == null || neighbors.length != 2) {
         continue;
       }
-      for (final neighbor in neighborsOf[key]!) {
+      for (final neighbor in neighbors) {
         if (consumed.contains(edgeKey(key, neighbor))) {
           continue;
         }
@@ -968,9 +1150,7 @@ class _SvgTransform {
     for (final match in RegExp(
       r'([a-zA-Z]+)\s*\(([^)]*)\)',
     ).allMatches(source ?? '')) {
-      final values = RegExp(
-        r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?',
-      )
+      final values = RegExp(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?')
           .allMatches(match.group(2)!)
           .map((number) => double.parse(number.group(0)!))
           .toList(growable: false);

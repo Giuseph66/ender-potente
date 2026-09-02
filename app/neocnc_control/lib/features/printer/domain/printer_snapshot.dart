@@ -13,6 +13,8 @@ class PrinterSnapshot {
     this.bedTarget,
     this.endstops = const {},
     this.sdStatus = 'Não consultado',
+    this.sdBytesDone = 0,
+    this.sdBytesTotal = 0,
     this.lastError,
   });
 
@@ -29,7 +31,14 @@ class PrinterSnapshot {
   final double? bedTarget;
   final Map<String, String> endstops;
   final String sdStatus;
+
+  /// Progresso relatado por `M27` enquanto a máquina executa do cartão.
+  final int sdBytesDone;
+  final int sdBytesTotal;
   final String? lastError;
+
+  double? get sdProgress =>
+      sdBytesTotal > 0 ? sdBytesDone / sdBytesTotal : null;
 
   PrinterSnapshot copyWith({
     bool? isConnected,
@@ -45,6 +54,8 @@ class PrinterSnapshot {
     double? bedTarget,
     Map<String, String>? endstops,
     String? sdStatus,
+    int? sdBytesDone,
+    int? sdBytesTotal,
     String? lastError,
     bool clearPortName = false,
     bool clearLastError = false,
@@ -63,6 +74,8 @@ class PrinterSnapshot {
       bedTarget: bedTarget ?? this.bedTarget,
       endstops: endstops ?? this.endstops,
       sdStatus: sdStatus ?? this.sdStatus,
+      sdBytesDone: sdBytesDone ?? this.sdBytesDone,
+      sdBytesTotal: sdBytesTotal ?? this.sdBytesTotal,
       lastError: clearLastError ? null : lastError ?? this.lastError,
     );
   }

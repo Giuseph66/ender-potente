@@ -125,6 +125,36 @@ void main() {
     expect(centerHeight, lessThan(outlineHeight));
   });
 
+  test('modo centro segue um traço fino dentro de um bbox grande', () {
+    // Fita em "L" de espessura 6 num bbox 100x100: a resolução do raster tem
+    // que sair da espessura do traço, não do bounding box, senão a forma
+    // colapsa em riscos retos.
+    const svg = '''
+        <svg viewBox="0 0 100 100">
+          <path d="M0,0 L100,0 L100,100 L94,100 L94,6 L0,6 Z"/>
+        </svg>
+      ''';
+    final centerline = PlotImporter.fromSvg(
+      svg,
+      label: 'L.svg',
+      mode: SvgTraceMode.centerline,
+    );
+
+    // Um traço contínuo (uma descida de caneta) cobrindo os dois braços do L.
+    expect(centerline.strokes, hasLength(1));
+    final dimensions = PlotImporter.measure(centerline.strokes);
+    expect(dimensions.width, greaterThan(150));
+    expect(dimensions.height, greaterThan(150));
+    var length = 0.0;
+    for (final stroke in centerline.strokes) {
+      for (var i = 0; i + 1 < stroke.length; i++) {
+        length += (stroke[i + 1] - stroke[i]).distance;
+      }
+    }
+    // O eixo central do L mede ~194 unidades de origem (~388 mm na mesa).
+    expect(length, closeTo(390, 40));
+  });
+
   test('extrai o contorno de uma área preta da imagem', () async {
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder)
