@@ -1153,6 +1153,7 @@ class _CncDashboardState extends State<CncDashboard>
         onAbort: _abortJob,
         onSpindleOn: _spindleOn,
         onSpindleOff: () => _perform(_controller.spindleOff),
+        spindleOn: _controller.isSpindleOn,
       ),
       _ControlTab.relativeMotion => _MotionPanel(
         enabled: snapshot.isConnected,

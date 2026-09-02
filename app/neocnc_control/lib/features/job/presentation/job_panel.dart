@@ -33,6 +33,7 @@ class JobPanel extends StatelessWidget {
     required this.onAbort,
     required this.onSpindleOn,
     required this.onSpindleOff,
+    required this.spindleOn,
   });
 
   final GcodeJob? job;
@@ -59,6 +60,9 @@ class JobPanel extends StatelessWidget {
   final VoidCallback onAbort;
   final VoidCallback onSpindleOn;
   final VoidCallback onSpindleOff;
+
+  /// Estado da ferramenta segundo os `M3`/`M5` que o app confirmou.
+  final bool spindleOn;
 
   bool get _readyToUpload =>
       job != null && violations.isEmpty && connected && !uploading;
@@ -294,16 +298,21 @@ class JobPanel extends StatelessWidget {
                 style: TextStyle(color: NeoCncColors.muted, fontSize: 12),
               ),
               const SizedBox(height: 14),
+              _SpindleState(on: spindleOn, connected: connected),
+              const SizedBox(height: 12),
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   OutlinedButton.icon(
-                    onPressed: connected ? onSpindleOn : null,
+                    key: const Key('spindle-on'),
+                    onPressed: connected && !spindleOn ? onSpindleOn : null,
                     icon: const Icon(Icons.power_settings_new_rounded),
                     label: const Text('LIGAR (M3)'),
                   ),
                   OutlinedButton.icon(
+                    key: const Key('spindle-off'),
                     onPressed: connected ? onSpindleOff : null,
                     style: OutlinedButton.styleFrom(
                       foregroundColor: NeoCncColors.danger,
@@ -311,12 +320,72 @@ class JobPanel extends StatelessWidget {
                     icon: const Icon(Icons.power_off_rounded),
                     label: const Text('DESLIGAR (M5)'),
                   ),
+                  if (!connected)
+                    const Text(
+                      'Conecte a máquina para comandar a ferramenta.',
+                      style: TextStyle(
+                        color: NeoCncColors.muted,
+                        fontSize: 11,
+                      ),
+                    ),
                 ],
               ),
             ],
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Estado da ferramenta em destaque: uma fresa girando é o item mais
+/// perigoso da máquina, e até agora a tela não dizia se ela estava ligada.
+class _SpindleState extends StatelessWidget {
+  const _SpindleState({required this.on, required this.connected});
+
+  final bool on;
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = !connected
+        ? NeoCncColors.muted
+        : on
+        ? NeoCncColors.danger
+        : NeoCncColors.cyan;
+    final label = !connected
+        ? 'SEM CONEXÃO'
+        : on
+        ? 'FERRAMENTA LIGADA'
+        : 'FERRAMENTA DESLIGADA';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .12),
+        border: Border.all(color: color.withValues(alpha: .6)),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            on && connected
+                ? Icons.warning_amber_rounded
+                : Icons.check_circle_outline_rounded,
+            color: color,
+            size: 16,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

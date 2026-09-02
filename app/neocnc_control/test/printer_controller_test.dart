@@ -58,6 +58,47 @@ void main() {
       ]),
     );
   });
+  test('M3 e M5 acendem e apagam o estado da ferramenta', () async {
+    final transport = _AutoAckTransport();
+    final controller = PrinterController(transport: transport);
+    addTearDown(controller.dispose);
+
+    await controller.connect('/dev/mock');
+    expect(controller.isSpindleOn, isFalse);
+
+    await controller.spindleOn();
+    expect(transport.commands, contains('M3 S255'));
+    expect(controller.isSpindleOn, isTrue);
+
+    await controller.spindleOff();
+    expect(transport.commands, contains('M5'));
+    expect(controller.isSpindleOn, isFalse);
+  });
+
+  test('perder a conexão zera o estado da ferramenta', () async {
+    final transport = _AutoAckTransport();
+    final controller = PrinterController(transport: transport);
+    addTearDown(controller.dispose);
+
+    await controller.connect('/dev/mock');
+    await controller.spindleOn();
+    expect(controller.isSpindleOn, isTrue);
+
+    // Desconectado, o app não pode mais afirmar que a fresa está girando.
+    await controller.disconnect();
+    expect(controller.isSpindleOn, isFalse);
+  });
+
+  test('recusa potência fora de 0-255', () async {
+    final transport = _AutoAckTransport();
+    final controller = PrinterController(transport: transport);
+    addTearDown(controller.dispose);
+
+    await controller.connect('/dev/mock');
+    expect(() => controller.spindleOn(power: 300), throwsArgumentError);
+    expect(() => controller.spindleOn(power: -1), throwsArgumentError);
+  });
+
 }
 
 class _AutoAckTransport implements PrinterTransport {

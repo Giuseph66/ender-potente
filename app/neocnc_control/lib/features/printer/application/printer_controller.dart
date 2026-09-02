@@ -42,6 +42,7 @@ class PrinterController extends ChangeNotifier {
   bool _binaryModeActive = false;
   DateTime _lastProgressNotify = DateTime.fromMillisecondsSinceEpoch(0);
   String? _sdJobName;
+  bool _spindleOn = false;
 
   PrinterSnapshot get snapshot => _snapshot;
   List<String> get ports => List.unmodifiable(_ports);
@@ -54,6 +55,12 @@ class PrinterController extends ChangeNotifier {
   int get drawingCompletedSegments => _drawingCompletedSegments;
   int get drawingSegmentCount => _drawingSegmentCount;
   bool get isUploading => _uploading;
+
+  /// Se a microrretífica está ligada, pelo que o app mandou. O Marlin não
+  /// reporta o estado do pino, então isto reflete os `M3`/`M5` confirmados —
+  /// e volta para desligada em qualquer perda de conexão, quando deixa de ser
+  /// possível afirmar o que a máquina está fazendo.
+  bool get isSpindleOn => _spindleOn;
   double get uploadProgress => _uploadProgress;
 
   /// Arquivo selecionado por `M23`, ou `null` quando nenhum trabalho roda.
@@ -119,6 +126,7 @@ class PrinterController extends ChangeNotifier {
     _sdJobName = null;
 
     await _transport.disconnect();
+    _spindleOn = false;
     _snapshot = _snapshot.copyWith(
       isConnected: false,
       clearPortName: true,
@@ -483,6 +491,7 @@ class PrinterController extends ChangeNotifier {
     await _enqueue(() async {
       await _sendAndAwait('M524', timeout: const Duration(seconds: 15));
       await _sendAndAwait('M5', timeout: const Duration(seconds: 20));
+      _spindleOn = false;
       await _setLcdMessage('NeoCNC: Abortado');
     });
     _sdJobName = null;
@@ -495,13 +504,18 @@ class PrinterController extends ChangeNotifier {
     if (power < 0 || power > 255) {
       throw ArgumentError.value(power, 'power', 'Use um valor entre 0 e 255.');
     }
-    return _enqueue(
-      () => _sendAndAwait('M3 S$power', timeout: const Duration(seconds: 30)),
-    );
+    return _enqueue(() async {
+      await _sendAndAwait('M3 S$power', timeout: const Duration(seconds: 30));
+      _spindleOn = true;
+      _notify();
+    });
   }
 
-  Future<void> spindleOff() =>
-      _enqueue(() => _sendAndAwait('M5', timeout: const Duration(seconds: 30)));
+  Future<void> spindleOff() => _enqueue(() async {
+    await _sendAndAwait('M5', timeout: const Duration(seconds: 30));
+    _spindleOn = false;
+    _notify();
+  });
 
   static final RegExp _sdNamePattern = RegExp(
     r'^[A-Z0-9_~-]{1,8}\.[A-Z0-9]{1,3}$',

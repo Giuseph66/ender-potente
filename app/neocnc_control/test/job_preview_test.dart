@@ -85,6 +85,7 @@ Widget _harness(GcodeJob job) {
           onAbort: () {},
           onSpindleOn: () {},
           onSpindleOff: () {},
+          spindleOn: false,
         ),
       ),
     ),
