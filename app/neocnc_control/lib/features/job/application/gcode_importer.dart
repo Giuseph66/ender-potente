@@ -38,6 +38,9 @@ abstract final class GcodeImporter {
     final tools = <int>{};
     final cutPaths = <List<ui.Offset>>[];
     final travelPaths = <List<ui.Offset>>[];
+    // Mesma geometria dos caminhos acima, mas na ordem de execução: é o que
+    // permite simular por onde a ferramenta passa e quando.
+    final moves = <JobMove>[];
 
     var absolute = true;
     var inches = false;
@@ -99,6 +102,9 @@ abstract final class GcodeImporter {
     }
 
     void appendPreview(GcodeMoveKind kind, ui.Offset from, ui.Offset to) {
+      if (from != to) {
+        moves.add(JobMove(from: from, to: to, kind: kind));
+      }
       if (kind == GcodeMoveKind.feed) {
         if (currentTravel != null) {
           if (currentTravel!.length >= 2) {
@@ -346,6 +352,7 @@ abstract final class GcodeImporter {
       bounds: bounds,
       cutPaths: List<List<ui.Offset>>.unmodifiable(cutPaths),
       travelPaths: List<List<ui.Offset>>.unmodifiable(travelPaths),
+      moves: List<JobMove>.unmodifiable(moves),
       cutLengthMm: cutLength,
       travelLengthMm: travelLength,
       estimatedDuration: Duration(seconds: seconds.round()),

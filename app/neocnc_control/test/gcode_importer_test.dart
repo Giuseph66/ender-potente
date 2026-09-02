@@ -126,4 +126,37 @@ void main() {
     expect(GcodeJob.toShortFilename('/tmp/furos.drl'), 'FUROS.GCO');
     expect(GcodeJob.toShortFilename('---.nc'), 'JOB.GCO');
   });
+
+  test('guarda os movimentos na ordem de execução para simular', () {
+    final job = GcodeImporter.parse(_flatCamIsolation, name: 'isola');
+
+    // O G00 posiciona em (10,10) e os G01 cortam até (20,10) e (20,30).
+    expect(job.moves, hasLength(3));
+    expect(job.moves.first.cutting, isFalse);
+    expect(job.moves.first.to, const Offset(10, 10));
+    expect(job.moves[1].cutting, isTrue);
+    expect(job.moves[1].to, const Offset(20, 10));
+    expect(job.moves.last.to, const Offset(20, 30));
+
+    // O comprimento simulado é só o plano XY: 14.14 de posicionamento mais
+    // 30 de corte. Fica abaixo de corte + deslocamento porque aqueles somam
+    // também os mergulhos e recuos em Z.
+    expect(job.previewLength, closeTo(44.142, .01));
+    expect(
+      job.previewLength,
+      lessThan(job.cutLengthMm + job.travelLengthMm),
+    );
+  });
+
+  test('amostra a posição da ferramenta ao longo do trabalho', () {
+    final job = GcodeImporter.parse(_flatCamIsolation, name: 'isola');
+
+    expect(job.sampleAt(0).position, const Offset(0, 0));
+    // 14.14 mm de deslocamento até (10,10), depois 10 mm cortando em X.
+    final middleOfFirstCut = job.moves.first.length + 5;
+    expect(job.sampleAt(middleOfFirstCut).position, const Offset(15, 10));
+    expect(job.sampleAt(middleOfFirstCut).cutting, isTrue);
+    // Além do fim fica parado no último ponto.
+    expect(job.sampleAt(99999).position, const Offset(20, 30));
+  });
 }

@@ -35,6 +35,21 @@ enum GcodeMoveKind {
   feed,
 }
 
+/// Um movimento em XY na ordem em que a máquina vai executá-lo. As listas
+/// `cutPaths`/`travelPaths` servem para desenhar o traçado; esta guarda a
+/// cronologia, que é o que permite simular o trabalho.
+class JobMove {
+  const JobMove({required this.from, required this.to, required this.kind});
+
+  final ui.Offset from;
+  final ui.Offset to;
+  final GcodeMoveKind kind;
+
+  bool get cutting => kind == GcodeMoveKind.feed;
+
+  double get length => (to - from).distance;
+}
+
 class GcodeBounds {
   const GcodeBounds({
     required this.minX,
@@ -116,6 +131,7 @@ class GcodeJob {
     required this.warnings,
     required this.blockingIssues,
     required this.byteSize,
+    this.moves = const [],
   });
 
   final String name;
@@ -140,7 +156,36 @@ class GcodeJob {
   final List<String> blockingIssues;
   final int byteSize;
 
+  /// Movimentos em XY na ordem de execução, para simular o trabalho.
+  final List<JobMove> moves;
+
   int get commandCount => commands.length;
+
+  double get previewLength =>
+      moves.fold<double>(0, (total, move) => total + move.length);
+
+  /// Onde a ferramenta está depois de percorrer [distance] mm do trabalho, e
+  /// se nesse ponto ela está cortando.
+  ({ui.Offset position, bool cutting}) sampleAt(double distance) {
+    if (moves.isEmpty) {
+      return (position: ui.Offset.zero, cutting: false);
+    }
+    var remaining = distance.clamp(0.0, previewLength).toDouble();
+    for (final move in moves) {
+      final length = move.length;
+      if (length <= 0) {
+        continue;
+      }
+      if (remaining <= length) {
+        return (
+          position: ui.Offset.lerp(move.from, move.to, remaining / length)!,
+          cutting: move.cutting,
+        );
+      }
+      remaining -= length;
+    }
+    return (position: moves.last.to, cutting: moves.last.cutting);
+  }
 
   /// Nome 8.3 em maiúsculas aceito pelo `M23` do Marlin.
   static String toShortFilename(String source, {String extension = 'GCO'}) {

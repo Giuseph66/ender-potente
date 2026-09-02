@@ -557,8 +557,60 @@ class _JobPreview extends StatefulWidget {
   State<_JobPreview> createState() => _JobPreviewState();
 }
 
-class _JobPreviewState extends State<_JobPreview> {
+class _JobPreviewState extends State<_JobPreview>
+    with SingleTickerProviderStateMixin {
+  static const _minDuration = Duration(seconds: 3);
+  static const _maxDuration = Duration(seconds: 20);
+
   bool _fitToJob = true;
+  late final AnimationController _playback;
+
+  @override
+  void initState() {
+    super.initState();
+    _playback = AnimationController(vsync: this)
+      ..addListener(() => setState(() {}));
+  }
+
+  @override
+  void didUpdateWidget(_JobPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.job != widget.job) {
+      _playback
+        ..stop()
+        ..value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _playback.dispose();
+    super.dispose();
+  }
+
+  void _togglePlayback() {
+    if (_playback.isAnimating) {
+      _playback.stop();
+      setState(() {});
+      return;
+    }
+    if (widget.job.moves.isEmpty) {
+      return;
+    }
+    // Roda numa escala confortável de assistir: um corte de meia hora não
+    // pode levar meia hora aqui.
+    final scaled = widget.job.estimatedDuration.inMilliseconds ~/ 12;
+    _playback.duration = Duration(
+      milliseconds: scaled.clamp(
+        _minDuration.inMilliseconds,
+        _maxDuration.inMilliseconds,
+      ),
+    );
+    if (_playback.value >= 1) {
+      _playback.value = 0;
+    }
+    _playback.forward();
+  }
 
   double _viewAspect(bool fitToJob) {
     final view = _viewportFor(widget.job, widget.limits, fitToJob);
@@ -572,6 +624,7 @@ class _JobPreviewState extends State<_JobPreview> {
   Widget build(BuildContext context) {
     final canFit = !widget.job.bounds.isEmpty;
     final fitToJob = _fitToJob && canFit;
+    final canSimulate = widget.job.moves.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -599,10 +652,48 @@ class _JobPreviewState extends State<_JobPreview> {
                         setState(() => _fitToJob = selection.first)
                   : null,
             ),
+            FilledButton.tonalIcon(
+              key: const Key('job-preview-playback'),
+              onPressed: canSimulate ? _togglePlayback : null,
+              icon: Icon(
+                _playback.isAnimating
+                    ? Icons.pause_rounded
+                    : Icons.play_arrow_rounded,
+              ),
+              label: Text(_playback.isAnimating ? 'PAUSAR' : 'SIMULAR'),
+            ),
             const _PreviewLegend(),
           ],
         ),
-        const SizedBox(height: 10),
+        if (canSimulate) ...[
+          Row(
+            children: [
+              Expanded(
+                child: Slider(
+                  key: const Key('job-preview-scrub'),
+                  value: _playback.value.clamp(0, 1),
+                  onChanged: (value) {
+                    _playback.stop();
+                    setState(() => _playback.value = value);
+                  },
+                ),
+              ),
+              SizedBox(
+                width: 130,
+                child: Text(
+                  '${(_playback.value * 100).round()}%  •  '
+                  '${(widget.job.previewLength * _playback.value).round()} '
+                  'de ${widget.job.previewLength.round()} mm',
+                  style: const TextStyle(
+                    color: NeoCncColors.cyan,
+                    fontSize: 10,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ] else
+          const SizedBox(height: 10),
         // A caixa acompanha a proporção do que está enquadrado: um trabalho
         // largo e baixo não precisa de um quadrado cheio de vazio.
         Center(
@@ -615,6 +706,11 @@ class _JobPreviewState extends State<_JobPreview> {
                   job: widget.job,
                   limits: widget.limits,
                   fitToJob: fitToJob,
+                  // Em repouso no começo mostra o traçado inteiro em força
+                  // total; a simulação só assume depois que ela anda.
+                  progress: canSimulate && _playback.value > 0
+                      ? _playback.value
+                      : null,
                 ),
                 child: const SizedBox.expand(),
               ),
@@ -686,6 +782,7 @@ class _JobPreviewPainter extends CustomPainter {
     required this.job,
     required this.limits,
     required this.fitToJob,
+    this.progress,
   });
 
   final GcodeJob job;
@@ -693,6 +790,9 @@ class _JobPreviewPainter extends CustomPainter {
 
   /// Enquadra o envelope do trabalho em vez da mesa inteira.
   final bool fitToJob;
+
+  /// Fração do trabalho já percorrida na simulação (nulo = sem simulação).
+  final double? progress;
 
   /// Passos de grade e de barra de escala que dão números redondos.
   static const _niceSteps = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
@@ -735,27 +835,32 @@ class _JobPreviewPainter extends CustomPainter {
         ..strokeWidth = 1.5,
     );
 
-    _paintPaths(
-      canvas,
-      job.travelPaths,
-      toCanvas,
-      Paint()
-        ..color = NeoCncColors.muted.withValues(alpha: .5)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1,
-      dashed: true,
-    );
-    _paintPaths(
-      canvas,
-      job.cutPaths,
-      toCanvas,
-      Paint()
-        ..color = NeoCncColors.cyan
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = fitToJob ? 2.2 : 1.6
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round,
-    );
+    final simulation = progress;
+    if (simulation != null) {
+      _paintSimulation(canvas, toCanvas, simulation);
+    } else {
+      _paintPaths(
+        canvas,
+        job.travelPaths,
+        toCanvas,
+        Paint()
+          ..color = NeoCncColors.muted.withValues(alpha: .5)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1,
+        dashed: true,
+      );
+      _paintPaths(
+        canvas,
+        job.cutPaths,
+        toCanvas,
+        Paint()
+          ..color = NeoCncColors.cyan
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = fitToJob ? 2.2 : 1.6
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round,
+      );
+    }
 
     if (!bounds.isEmpty) {
       _paintEnvelope(canvas, bounds, toCanvas);
@@ -832,6 +937,79 @@ class _JobPreviewPainter extends CustomPainter {
       }
       canvas.drawPath(drawn, paint);
     }
+  }
+
+  /// Desenha o trabalho até onde a simulação chegou: o que já passou em
+  /// destaque, o que falta apagado, e a ferramenta na posição atual.
+  void _paintSimulation(
+    Canvas canvas,
+    Offset Function(Offset) toCanvas,
+    double progress,
+  ) {
+    final doneCut = Paint()
+      ..color = NeoCncColors.cyan
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = fitToJob ? 2.4 : 1.8
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final pendingCut = Paint()
+      ..color = NeoCncColors.cyan.withValues(alpha: .2)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = fitToJob ? 2.0 : 1.4
+      ..strokeCap = StrokeCap.round;
+    final doneTravel = Paint()
+      ..color = NeoCncColors.muted.withValues(alpha: .65)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    final pendingTravel = Paint()
+      ..color = NeoCncColors.muted.withValues(alpha: .15)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+
+    final target = job.previewLength * progress.clamp(0.0, 1.0);
+    var walked = 0.0;
+    for (final move in job.moves) {
+      final from = toCanvas(move.from);
+      final to = toCanvas(move.to);
+      final end = walked + move.length;
+      final done = end <= target;
+      final partial = !done && walked < target && move.length > 0;
+      final cut = Offset.lerp(
+        from,
+        to,
+        move.length <= 0 ? 0 : ((target - walked) / move.length).clamp(0.0, 1.0),
+      )!;
+      if (move.cutting) {
+        canvas.drawLine(from, to, done ? doneCut : pendingCut);
+        if (partial) {
+          canvas.drawLine(from, cut, doneCut);
+        }
+      } else {
+        _dashedLine(canvas, from, to, done ? doneTravel : pendingTravel);
+        if (partial) {
+          _dashedLine(canvas, from, cut, doneTravel);
+        }
+      }
+      walked = end;
+    }
+
+    final sample = job.sampleAt(target);
+    final head = toCanvas(sample.position);
+    canvas.drawCircle(
+      head,
+      7,
+      Paint()
+        ..color = (sample.cutting ? NeoCncColors.cyan : NeoCncColors.muted)
+            .withValues(alpha: .22),
+    );
+    canvas.drawCircle(
+      head,
+      3.6,
+      Paint()
+        ..color = sample.cutting ? NeoCncColors.cyan : NeoCncColors.ink
+        ..style = sample.cutting ? PaintingStyle.fill : PaintingStyle.stroke
+        ..strokeWidth = 1.6,
+    );
   }
 
   void _paintEnvelope(
@@ -1000,7 +1178,8 @@ class _JobPreviewPainter extends CustomPainter {
   bool shouldRepaint(_JobPreviewPainter oldDelegate) =>
       oldDelegate.job != job ||
       oldDelegate.limits != limits ||
-      oldDelegate.fitToJob != fitToJob;
+      oldDelegate.fitToJob != fitToJob ||
+      oldDelegate.progress != progress;
 }
 
 

@@ -28,6 +28,23 @@ GcodeJob _job({
     travelPaths: [
       [ui.Offset(maxX, maxY), ui.Offset(minX, minY)],
     ],
+    moves: [
+      JobMove(
+        from: const ui.Offset(0, 0),
+        to: ui.Offset(minX, minY),
+        kind: GcodeMoveKind.rapid,
+      ),
+      JobMove(
+        from: ui.Offset(minX, minY),
+        to: ui.Offset(maxX, minY),
+        kind: GcodeMoveKind.feed,
+      ),
+      JobMove(
+        from: ui.Offset(maxX, minY),
+        to: ui.Offset(maxX, maxY),
+        kind: GcodeMoveKind.feed,
+      ),
+    ],
     cutLengthMm: 183,
     travelLengthMm: 103,
     estimatedDuration: const Duration(minutes: 1),
@@ -144,5 +161,78 @@ void main() {
       {false},
       reason: 'sem envelope só resta mostrar a mesa inteira',
     );
+  });
+
+  testWidgets('simula o trabalho e permite arrastar pelo percurso', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const ui.Size(1600, 2000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(_harness(_job()));
+    await tester.pumpAndSettle();
+
+    const playback = Key('job-preview-playback');
+    expect(
+      find.descendant(of: find.byKey(playback), matching: find.text('SIMULAR')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(playback));
+    await tester.pump();
+    expect(
+      find.descendant(of: find.byKey(playback), matching: find.text('PAUSAR')),
+      findsOneWidget,
+    );
+
+    // Com a animação em curso o progresso avança.
+    await tester.pump(const Duration(seconds: 1));
+    final slider = tester.widget<Slider>(
+      find.byKey(const Key('job-preview-scrub')),
+    );
+    expect(slider.value, greaterThan(0));
+
+    await tester.tap(find.byKey(playback));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: find.byKey(playback), matching: find.text('SIMULAR')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('sem movimentos não há o que simular', (tester) async {
+    tester.view.physicalSize = const ui.Size(1600, 2000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    final semMovimentos = GcodeJob(
+      name: 'x.nc',
+      commands: const [],
+      bounds: const GcodeBounds(
+        minX: 0,
+        maxX: 10,
+        minY: 0,
+        maxY: 10,
+        minZ: 0,
+        maxZ: 1,
+      ),
+      cutPaths: const [],
+      travelPaths: const [],
+      cutLengthMm: 0,
+      travelLengthMm: 0,
+      estimatedDuration: Duration.zero,
+      tools: const {},
+      usesSpindle: false,
+      warnings: const [],
+      blockingIssues: const [],
+      byteSize: 0,
+    );
+
+    await tester.pumpWidget(_harness(semMovimentos));
+    await tester.pumpAndSettle();
+
+    final button = find.byKey(const Key('job-preview-playback'));
+    expect(tester.widget<FilledButton>(button).onPressed, isNull);
   });
 }
