@@ -10,6 +10,8 @@ Widget _harness({
   required bool spindleOn,
   VoidCallback? onSpindleOn,
   VoidCallback? onSpindleOff,
+  ValueChanged<int>? onSpindlePowerChanged,
+  ValueChanged<int>? onSpindlePowerCommitted,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -30,6 +32,7 @@ Widget _harness({
           sdStatus: '',
           sdProgress: null,
           spindleOn: spindleOn,
+          spindlePower: 100,
           onImport: () {},
           onZOffsetChanged: (_) {},
           onZOffsetCommitted: (_) {},
@@ -40,6 +43,8 @@ Widget _harness({
           onAbort: () {},
           onSpindleOn: onSpindleOn ?? () {},
           onSpindleOff: onSpindleOff ?? () {},
+          onSpindlePowerChanged: onSpindlePowerChanged ?? (_) {},
+          onSpindlePowerCommitted: onSpindlePowerCommitted ?? (_) {},
         ),
       ),
     ),

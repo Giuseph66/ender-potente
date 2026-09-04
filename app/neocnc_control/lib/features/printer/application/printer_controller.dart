@@ -498,11 +498,14 @@ class PrinterController extends ChangeNotifier {
     _notify();
   }
 
-  /// Liga a microrretífica. `M3` espera `SPINDLE_LASER_POWERUP_DELAY` antes de
-  /// devolver o `ok`, por isso o timeout é folgado.
-  Future<void> spindleOn({int power = 255}) {
-    if (power < 0 || power > 255) {
-      throw ArgumentError.value(power, 'power', 'Use um valor entre 0 e 255.');
+  /// Liga a microrretífica no PWM da saída HOTEND. `power` é porcentagem.
+  Future<void> spindleOn({int power = 100}) {
+    if (power < 1 || power > 100) {
+      throw ArgumentError.value(
+        power,
+        'power',
+        'Use uma potência entre 1 e 100%.',
+      );
     }
     return _enqueue(() async {
       await _sendAndAwait('M3 S$power', timeout: const Duration(seconds: 30));

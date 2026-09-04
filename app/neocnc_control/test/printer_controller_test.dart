@@ -66,8 +66,8 @@ void main() {
     await controller.connect('/dev/mock');
     expect(controller.isSpindleOn, isFalse);
 
-    await controller.spindleOn();
-    expect(transport.commands, contains('M3 S255'));
+    await controller.spindleOn(power: 42);
+    expect(transport.commands, contains('M3 S42'));
     expect(controller.isSpindleOn, isTrue);
 
     await controller.spindleOff();
@@ -89,16 +89,16 @@ void main() {
     expect(controller.isSpindleOn, isFalse);
   });
 
-  test('recusa potência fora de 0-255', () async {
+  test('recusa potência fora de 1-100%', () async {
     final transport = _AutoAckTransport();
     final controller = PrinterController(transport: transport);
     addTearDown(controller.dispose);
 
     await controller.connect('/dev/mock');
-    expect(() => controller.spindleOn(power: 300), throwsArgumentError);
+    expect(() => controller.spindleOn(power: 101), throwsArgumentError);
     expect(() => controller.spindleOn(power: -1), throwsArgumentError);
+    expect(() => controller.spindleOn(power: 0), throwsArgumentError);
   });
-
 }
 
 class _AutoAckTransport implements PrinterTransport {

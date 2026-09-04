@@ -34,6 +34,9 @@ class JobPanel extends StatelessWidget {
     required this.onSpindleOn,
     required this.onSpindleOff,
     required this.spindleOn,
+    required this.spindlePower,
+    required this.onSpindlePowerChanged,
+    required this.onSpindlePowerCommitted,
   });
 
   final GcodeJob? job;
@@ -60,6 +63,9 @@ class JobPanel extends StatelessWidget {
   final VoidCallback onAbort;
   final VoidCallback onSpindleOn;
   final VoidCallback onSpindleOff;
+  final int spindlePower;
+  final ValueChanged<int> onSpindlePowerChanged;
+  final ValueChanged<int> onSpindlePowerCommitted;
 
   /// Estado da ferramenta segundo os `M3`/`M5` que o app confirmou.
   final bool spindleOn;
@@ -106,9 +112,7 @@ class JobPanel extends StatelessWidget {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.folder_open_rounded),
-                    label: Text(
-                      importing ? 'LENDO…' : 'IMPORTAR .NC / .GCODE',
-                    ),
+                    label: Text(importing ? 'LENDO…' : 'IMPORTAR .NC / .GCODE'),
                   ),
                 ],
               ),
@@ -258,10 +262,7 @@ class JobPanel extends StatelessWidget {
                   child: Text(
                     'Faça HOME XY e HOME Z antes de iniciar: sem referência a '
                     'máquina não sabe onde está a placa.',
-                    style: TextStyle(
-                      color: NeoCncColors.amber,
-                      fontSize: 11,
-                    ),
+                    style: TextStyle(color: NeoCncColors.amber, fontSize: 11),
                   ),
                 ),
               const SizedBox(height: 14),
@@ -269,10 +270,7 @@ class JobPanel extends StatelessWidget {
               const SizedBox(height: 14),
               Text(
                 'CARTÃO  $sdStatus',
-                style: const TextStyle(
-                  color: NeoCncColors.muted,
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: NeoCncColors.muted, fontSize: 12),
               ),
               if (sdProgress != null) ...[
                 const SizedBox(height: 8),
@@ -292,13 +290,27 @@ class JobPanel extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'M3 liga o relé da microrretífica na saída FAN0 e espera o '
-                'tempo de partida; M5 desliga. Sem PWM nesse pino: é liga e '
-                'desliga.',
+                'Saída HOTEND: PWM de 1 a 100% via M3 S1…S100. Conecte '
+                'somente ao opto/driver externo; nunca a microrretífica '
+                'direto na placa.',
                 style: TextStyle(color: NeoCncColors.muted, fontSize: 12),
               ),
               const SizedBox(height: 14),
               _SpindleState(on: spindleOn, connected: connected),
+              const SizedBox(height: 12),
+              Text(
+                'POTÊNCIA PWM  $spindlePower%',
+                style: const TextStyle(color: NeoCncColors.muted, fontSize: 12),
+              ),
+              Slider(
+                value: spindlePower.toDouble(),
+                min: 1,
+                max: 100,
+                divisions: 99,
+                label: '$spindlePower%',
+                onChanged: (value) => onSpindlePowerChanged(value.round()),
+                onChangeEnd: (value) => onSpindlePowerCommitted(value.round()),
+              ),
               const SizedBox(height: 12),
               Wrap(
                 spacing: 10,
@@ -309,7 +321,7 @@ class JobPanel extends StatelessWidget {
                     key: const Key('spindle-on'),
                     onPressed: connected && !spindleOn ? onSpindleOn : null,
                     icon: const Icon(Icons.power_settings_new_rounded),
-                    label: const Text('LIGAR (M3)'),
+                    label: Text('LIGAR $spindlePower% (M3)'),
                   ),
                   OutlinedButton.icon(
                     key: const Key('spindle-off'),
@@ -323,10 +335,7 @@ class JobPanel extends StatelessWidget {
                   if (!connected)
                     const Text(
                       'Conecte a máquina para comandar a ferramenta.',
-                      style: TextStyle(
-                        color: NeoCncColors.muted,
-                        fontSize: 11,
-                      ),
+                      style: TextStyle(color: NeoCncColors.muted, fontSize: 11),
                     ),
                 ],
               ),
@@ -436,7 +445,10 @@ class _JobSummary extends StatelessWidget {
           label: 'DESLOCAMENTO',
           value: '${job.travelLengthMm.toStringAsFixed(0)} mm',
         ),
-        _Metric(label: 'TEMPO EST.', value: _formatDuration(job.estimatedDuration)),
+        _Metric(
+          label: 'TEMPO EST.',
+          value: _formatDuration(job.estimatedDuration),
+        ),
         _Metric(
           label: 'FERRAMENTAS',
           value: job.tools.isEmpty ? '—' : job.tools.join(', '),
@@ -717,8 +729,7 @@ class _JobPreviewState extends State<_JobPreview>
               ],
               selected: {fitToJob},
               onSelectionChanged: canFit
-                  ? (selection) =>
-                        setState(() => _fitToJob = selection.first)
+                  ? (selection) => setState(() => _fitToJob = selection.first)
                   : null,
             ),
             FilledButton.tonalIcon(
@@ -950,7 +961,9 @@ class _JobPreviewPainter extends CustomPainter {
     double viewMaxY,
     Offset Function(Offset) toCanvas,
   ) {
-    final step = _niceStep(math.max(viewMaxX - viewMinX, viewMaxY - viewMinY) / 8);
+    final step = _niceStep(
+      math.max(viewMaxX - viewMinX, viewMaxY - viewMinY) / 8,
+    );
     final grid = Paint()
       ..color = NeoCncColors.line.withValues(alpha: .5)
       ..strokeWidth = 1;
@@ -1046,7 +1059,9 @@ class _JobPreviewPainter extends CustomPainter {
       final cut = Offset.lerp(
         from,
         to,
-        move.length <= 0 ? 0 : ((target - walked) / move.length).clamp(0.0, 1.0),
+        move.length <= 0
+            ? 0
+            : ((target - walked) / move.length).clamp(0.0, 1.0),
       )!;
       if (move.cutting) {
         canvas.drawLine(from, to, done ? doneCut : pendingCut);
@@ -1177,10 +1192,8 @@ class _JobPreviewPainter extends CustomPainter {
         ..strokeWidth = 1,
     );
     final scale = math.min(side / limits.maxX, side / limits.maxY);
-    Offset toMini(Offset point) => Offset(
-      rect.left + point.dx * scale,
-      rect.bottom - point.dy * scale,
-    );
+    Offset toMini(Offset point) =>
+        Offset(rect.left + point.dx * scale, rect.bottom - point.dy * scale);
     final job = Rect.fromPoints(
       toMini(Offset(bounds.minX, bounds.maxY)),
       toMini(Offset(bounds.maxX, bounds.minY)),
@@ -1250,8 +1263,6 @@ class _JobPreviewPainter extends CustomPainter {
       oldDelegate.fitToJob != fitToJob ||
       oldDelegate.progress != progress;
 }
-
-
 
 String _formatDuration(Duration duration) {
   if (duration.inMinutes < 1) {

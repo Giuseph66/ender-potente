@@ -46,6 +46,7 @@ class _CncDashboardState extends State<CncDashboard>
   int _baudRate = UsbSerialTransport.defaultBaudRate;
   double _step = 1;
   double _feedrate = 40;
+  int _spindlePower = 100;
   bool _mapArmed = false;
   Offset? _mapTarget;
   final List<List<Offset>> _drawingStrokes = [];
@@ -781,16 +782,16 @@ class _CncDashboardState extends State<CncDashboard>
     final confirmed = await _confirm(
       title: 'Ligar a ferramenta?',
       body:
-          'A microrretífica parte imediatamente e leva alguns segundos até a '
-          'rotação de trabalho. Afaste as mãos e confirme que a fresa está '
-          'presa na pinça.',
+          'A saída HOTEND aplicará PWM de $_spindlePower% no opto/driver '
+          'externo. Nunca conecte a microrretífica direto na placa. Afaste '
+          'as mãos e confirme a fresa presa na pinça.',
       accept: 'LIGAR',
       destructive: true,
     );
     if (!confirmed) {
       return;
     }
-    await _perform(_controller.spindleOn);
+    await _perform(() => _controller.spindleOn(power: _spindlePower));
   }
 
   Future<void> _sendManual() async {
@@ -1154,6 +1155,13 @@ class _CncDashboardState extends State<CncDashboard>
         onSpindleOn: _spindleOn,
         onSpindleOff: () => _perform(_controller.spindleOff),
         spindleOn: _controller.isSpindleOn,
+        spindlePower: _spindlePower,
+        onSpindlePowerChanged: (value) => setState(() => _spindlePower = value),
+        onSpindlePowerCommitted: (value) {
+          if (_controller.isSpindleOn) {
+            _perform(() => _controller.spindleOn(power: value));
+          }
+        },
       ),
       _ControlTab.relativeMotion => _MotionPanel(
         enabled: snapshot.isConnected,
@@ -2682,13 +2690,9 @@ class _RoutePreviewControls extends StatelessWidget {
             OutlinedButton.icon(
               onPressed: available ? () => onVisibleChanged(!visible) : null,
               icon: Icon(
-                visible
-                    ? Icons.visibility_rounded
-                    : Icons.visibility_outlined,
+                visible ? Icons.visibility_rounded : Icons.visibility_outlined,
               ),
-              label: Text(
-                visible ? 'PERCURSO VISÍVEL' : 'VER O PERCURSO',
-              ),
+              label: Text(visible ? 'PERCURSO VISÍVEL' : 'VER O PERCURSO'),
             ),
             if (visible && available)
               FilledButton.tonalIcon(
@@ -2710,10 +2714,7 @@ class _RoutePreviewControls extends StatelessWidget {
                 'DESENHO ${preview.drawLength.round()} mm  •  '
                 'DESLOCAMENTO ${preview.travelLength.round()} mm  •  '
                 '${preview.penLifts} SUBIDA(S)  •  ~${_duration(estimate)}',
-                style: const TextStyle(
-                  color: NeoCncColors.muted,
-                  fontSize: 11,
-                ),
+                style: const TextStyle(color: NeoCncColors.muted, fontSize: 11),
               ),
           ],
         ),
